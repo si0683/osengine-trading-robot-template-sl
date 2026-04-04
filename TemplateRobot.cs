@@ -135,7 +135,7 @@ namespace OsEngine.Robots
 
             // Подписки
             ParametrsChangeByUser += OnParametrsChangeByUser;
-            _tab.CandleFinishedEvent += OnCandleFinished;
+            _tab.CandleFinishedEvent += _tab_CandleFinishedEvent;
             _tab.PositionOpeningSuccesEvent += SetStopLoss;  // асинхронно, после подтверждения биржи
 
             SyncParams();
@@ -185,7 +185,7 @@ namespace OsEngine.Robots
         //   ГЛАВНЫЙ ОБРАБОТЧИК СВЕЧИ
         // ════════════════════════════════════════════════════════════════════════════
 
-        private void OnCandleFinished(List<Candle> candles)
+        private void _tab_CandleFinishedEvent(List<Candle> candles)
         {
             if (_regime.ValueString == "Off") return;
 
