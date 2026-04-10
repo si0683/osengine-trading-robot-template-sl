@@ -413,33 +413,6 @@ private void LogicClosePosition(List<Candle> candles)
 
 ---
 
-## Видимость репозитория на GitHub
-
-Чтобы репозиторий находили другие трейдеры и разработчики, стоит потратить 10 минут на несколько простых шагов.
-
-### Название репозитория
-
-Название имеет наибольший вес при ранжировании в поиске GitHub. `TemplateRobot` — короткое, но неинформативное: непонятно ни платформа, ни язык, ни назначение. Рекомендуемые варианты:
-
-| Вариант | Почему хорош |
-|---|---|
-| `osengine-trading-robot-template` | Содержит все ключевые слова: платформа, сфера, тип, назначение |
-| `osengine-strategy-template` | Акцент на стратегии |
-| `osengine-bot-framework` | Подходит, если планируется расширение |
-| `osengine-robot-boilerplate` | Классический термин для шаблонов |
-
-### Чек-лист видимости
-
-| Что сделать | Как |
-|---|---|
-| **Описание (Description)** | Под названием репозитория заполните поле: `Шаблон торгового робота для OsEngine с управлением рисками и стоп-лоссами` |
-| **Темы (Topics)** | Нажмите шестерёнку рядом с "Topics" и добавьте: `osengine`, `trading-bot`, `algorithmic-trading`, `csharp`, `template`, `quant` |
-| **README** | Используйте ключевые слова в заголовках — GitHub индексирует содержимое README |
-
-Темы кликабельны: пользователи, которые фильтруют по `osengine` или `trading-bot`, сразу попадут на ваш репозиторий.
-
----
-
 ## Автор
 
 Разработано трейдером **SidorenkoVA** — [@si0683](https://t.me/si0683)
@@ -451,3 +424,7 @@ private void LogicClosePosition(List<Candle> candles)
 Шаблон предоставляется "как есть". Используйте и модифицируйте свободно.
 
 > **Важно:** Торговые роботы несут финансовые риски. Всегда тестируйте стратегию на исторических данных и в режиме Paper Trading перед реальной торговлей.
+
+---
+
+`osengine` `trading-bot` `algorithmic-trading` `csharp` `dotnet` `template` `quant` `robot` `strategy` `stop-loss` `risk-management` `moex` `futures` `spot` `bybit` `binance` `trading-robot` `boilerplate` `osengine-robot` `osengine-template`
