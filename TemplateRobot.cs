@@ -404,79 +404,88 @@ namespace OsEngine.Robots
         {
             if (_tab?.Security == null || _tab.Security.Lot <= 0) return 0;
             if (entryPrice <= 0 || stopPrice <= 0) return 0;
-
-            _curStopPercent = Math.Abs(entryPrice - stopPrice) / entryPrice * 100m;
-            _curStopPrice = stopPrice;
-
-            decimal result = GetVolume(side, entryPrice);
-
-            _curStopPercent = 0;
-            _curStopPrice = 0;
-
-            return result;
+            decimal stopPercent = Math.Abs(entryPrice - stopPrice) / entryPrice * 100m;
+            return GetVolume(side, entryPrice, stopPrice, stopPercent);
         }
 
         /// <summary>
         /// Возвращает количество лотов/контрактов.
         /// Читает _curStopPercent и _curStopPrice — должны быть выставлены вызовом CalcVolume().
         /// </summary>
-        private decimal GetVolume(Side side, decimal entryPrice)
+        private decimal GetVolume(Side side, decimal entryPrice, decimal stopPrice, decimal stopPercent)
         {
-            if (_curStopPercent <= 0) return 0;
+            if (stopPercent <= 0) return 0;
+            if (entryPrice <= 0) return 0;
 
             decimal balance = GetAssetValue(_tab.Portfolio, _assetNameCurrent.ValueString);
             if (balance <= 0) return 0;
 
-            // Суммарный % риска: стоп + проскальзывание + 2 × комиссия (вход + выход)
-            decimal realStopPct = _curStopPercent / 100m
+            decimal realStopPct = stopPercent / 100m
                                 + _curSlippagePercent / 100m
                                 + _curFeePercent / 100m * 2m;
+            if (realStopPct <= 0) return 0;
 
             decimal riskPct = side == Side.Buy ? _curVolumeLong : _curVolumeShort;
             decimal riskMoney = balance * (riskPct / 100m);
-            decimal posSize = riskMoney / realStopPct;   // размер позиции в валюте депозита
-
+            decimal posSize = riskMoney / realStopPct;
             if (posSize < 0.5m) return 0;
 
-            var sec = _tab.Security;
-            decimal mult = (decimal)Math.Pow(10, sec.DecimalsVolume);
-            decimal qty = 0;
+            Security sec = _tab.Security;
+            if (sec == null) return 0;
+
+            decimal mult = sec.DecimalsVolume > 0
+                ? (decimal)Math.Pow(10, sec.DecimalsVolume)
+                : 1m;
+
+            decimal volume = 0;
 
             switch (_modeTrade.ValueString)
             {
                 case "SPOT и LinearPerpetual":
-                    qty = Math.Floor(posSize / entryPrice * mult) / mult;
+                    // posSize (в котируемой валюте) делим на цену → объём в базовой валюте
+                    volume = Math.Floor(posSize / entryPrice * mult) / mult;
                     break;
 
                 case "Stocks MOEX":
-                    qty = Math.Floor(posSize / entryPrice / sec.Lot * mult) / mult;
+                    // posSize делим на цену и на размер лота → число лотов
+                    if (sec.Lot <= 0) return 0;
+                    volume = Math.Floor(posSize / entryPrice / sec.Lot * mult) / mult;
                     break;
 
                 case "InversFutures":
-                    qty = Math.Floor(posSize / sec.Lot * mult) / mult;
+                    // Инверсный фьючерс: контракт номинирован в базовой валюте (напр. BTC),
+                    // posSize в USD → умножаем на entryPrice, делим на размер контракта
+                    if (sec.Lot <= 0) return 0;
+                    volume = Math.Floor(posSize * entryPrice / sec.Lot * mult) / mult;
                     break;
 
                 case "Futures MOEX":
-                    if (sec.PriceStep <= 0 || sec.PriceStepCost <= 0 ||
-                        sec.MarginBuy <= 0 || _curStopPrice <= 0)
+                    // Расчёт по риску через стоимость шага цены
+                    if (sec.PriceStep <= 0 || sec.PriceStepCost <= 0 || stopPrice <= 0)
                         return 0;
 
-                    decimal stopPts = Math.Abs(entryPrice - _curStopPrice);
+                    decimal margin = side == Side.Buy ? sec.MarginBuy : sec.MarginSell;
+                    if (margin <= 0) return 0;
+
+                    decimal stopPts = Math.Abs(entryPrice - stopPrice);
                     decimal lossPerContract = stopPts / sec.PriceStep * sec.PriceStepCost;
                     if (lossPerContract <= 0) return 0;
 
                     decimal byRisk = Math.Floor(riskMoney / lossPerContract);
-                    decimal byGo = Math.Floor(posSize / sec.MarginBuy);
-                    qty = Math.Min(byRisk, Math.Min(byGo, 100));
+                    decimal byGo = Math.Floor(balance / margin); // сколько контрактов позволяет ГО
+                    volume = Math.Min(byRisk, byGo);
                     break;
+
+                default:
+                    return 0;
             }
 
-            return qty > 0 ? qty : 0;
-        }
+            // Проверка минимального объёма
+            if (sec.MinTradeAmount > 0 && volume < sec.MinTradeAmount)
+                return 0;
 
-        // ════════════════════════════════════════════════════════════════════════════
-        //   ВСПОМОГАТЕЛЬНЫЙ МЕТОД: стоимость актива в портфеле
-        // ════════════════════════════════════════════════════════════════════════════
+            return volume;
+        }
 
         private decimal GetAssetValue(Portfolio portfolio, string assetName)
         {
@@ -486,12 +495,11 @@ namespace OsEngine.Robots
             List<PositionOnBoard> positions = portfolio.GetPositionOnBoard();
             if (positions == null) return 0;
 
-            for (int i = 0; i < positions.Count; i++)
+            foreach (PositionOnBoard p in positions)
             {
-                if (positions[i].SecurityNameCode.Equals(assetName, StringComparison.OrdinalIgnoreCase))
-                    return positions[i].ValueCurrent;
+                if (p.SecurityNameCode.Equals(assetName, StringComparison.OrdinalIgnoreCase))
+                    return p.ValueCurrent;
             }
-
             return 0;
         }
     }
