@@ -5,6 +5,7 @@ using OsEngine.OsTrader.Panels;
 using OsEngine.OsTrader.Panels.Attributes;
 using OsEngine.OsTrader.Panels.Tab;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 
 /* Description
@@ -69,9 +70,6 @@ namespace OsEngine.Robots
         private decimal _curFeePercent;
         private int _curBondDaysToMaturity;
         private int _curTimeZoneUtc;
-        // Временные поля, используются только внутри одного синхронного вызова GetVolume()
-        private decimal _curStopPercent;   // % расстояния до стопа от цены входа
-        private decimal _curStopPrice;     // абсолютная цена стопа (нужна для Futures MOEX)
 
         // ── Словарь стопов ───────────────────────────────────────────────────────────
         //
@@ -79,10 +77,11 @@ namespace OsEngine.Robots
         //              ордера ВНУТРИ BuyAtLimit/SellAtLimit, до отправки на биржу.
         //   Значение = начальная цена стопа, рассчитанная для этой конкретной заявки.
         //
-        //   Запись добавляется сразу после BuyAtLimit (синхронно).
-        //   Запись удаляется в SetStopLoss после выставления начального стопа (асинхронно).
-        //   При нескольких одновременных позициях каждая хранит свой стоп под своим ключом.
-        private readonly Dictionary<int, decimal> _stopByOrderId = new Dictionary<int, decimal>();
+        //   Запись добавляется сразу после BuyAtLimit (синхронно, поток свечей).
+        //   Запись удаляется в SetStopLoss после выставления начального стопа (асинхронно,
+        //   поток событий биржи). ConcurrentDictionary обеспечивает потокобезопасность
+        //   без явных lock-ов.
+        private readonly ConcurrentDictionary<int, decimal> _stopByOrderId = new ConcurrentDictionary<int, decimal>();
 
         // ════════════════════════════════════════════════════════════════════════════
         //   КОНСТРУКТОР
@@ -265,7 +264,7 @@ namespace OsEngine.Robots
                 //         return;
                 //     }
                 //
-                //     _stopByOrderId[pos.OpenOrders[0].NumberUser] = stopPrice;
+                //     _stopByOrderId.TryAdd(pos.OpenOrders[0].NumberUser, stopPrice);
                 //
                 //     SendNewLogMessage(
                 //         $"[OPEN] BUY | entry≈{entry:F4} stop={stopPrice:F4} vol={volume}",
@@ -297,7 +296,7 @@ namespace OsEngine.Robots
                 //         return;
                 //     }
                 //
-                //     _stopByOrderId[pos.OpenOrders[0].NumberUser] = stopPrice;
+                //     _stopByOrderId.TryAdd(pos.OpenOrders[0].NumberUser, stopPrice);
                 //
                 //     SendNewLogMessage(
                 //         $"[OPEN] SELL | entry≈{entry:F4} stop={stopPrice:F4} vol={volume}",
@@ -379,7 +378,7 @@ namespace OsEngine.Robots
             }
 
             // Удаляем сразу — при нескольких позициях стопы других ордеров остаются нетронутыми
-            _stopByOrderId.Remove(orderKey);
+            _stopByOrderId.TryRemove(orderKey, out _);
 
             decimal slippage = stopPrice * (_curSlippagePercent / 100m);
 
@@ -412,210 +411,245 @@ namespace OsEngine.Robots
             return GetVolume(side, entryPrice, stopPrice, stopPercent);
         }
 
+        // Контекст одного вызова GetVolume: накапливает промежуточные значения для лога.
+        // Живёт только на стеке — никакого выделения в куче.
+        private struct VolumeCalcCtx
+        {
+            public Side Side;
+            public decimal EntryPrice;
+            public decimal StopPrice;
+            public decimal StopPercent;
+            public decimal Balance;
+            public decimal RiskPct;
+            public decimal RiskMoney;
+            public decimal RealStopPct;
+            public decimal PosSize;
+            public decimal Volume;
+            public Security Sec;
+            public string RejectReason;
+        }
+
         private decimal GetVolume(Side side, decimal entryPrice, decimal stopPrice, decimal stopPercent)
         {
-            string rejectReason = "ok";
-            decimal volume = 0;
-            decimal balance = 0;
-            decimal realStopPct = 0;
-            decimal riskPct = 0;
-            decimal riskMoney = 0;
-            decimal posSize = 0;
-            Security sec = null;
+            VolumeCalcCtx ctx = new VolumeCalcCtx
+            {
+                Side = side,
+                EntryPrice = entryPrice,
+                StopPrice = stopPrice,
+                StopPercent = stopPercent,
+                RejectReason = "ok",
+            };
 
             // --- Входные параметры ---
-            if (stopPercent <= 0) { rejectReason = "stopPercent <= 0"; goto LogAndReturn; }
-            if (entryPrice <= 0) { rejectReason = "entryPrice <= 0"; goto LogAndReturn; }
+            if (stopPercent <= 0) return Reject(ref ctx, "stopPercent <= 0");
+            if (entryPrice <= 0) return Reject(ref ctx, "entryPrice <= 0");
 
             // --- Баланс ---
-            balance = GetAssetValue(_tab.Portfolio, _assetNameCurrent.ValueString);
-            if (balance <= 0) { rejectReason = "balance <= 0"; goto LogAndReturn; }
+            ctx.Balance = GetAssetValue(_tab.Portfolio, _assetNameCurrent.ValueString);
+            if (ctx.Balance <= 0) return Reject(ref ctx, "balance <= 0");
 
             // --- Риск ---
-            realStopPct = stopPercent / 100m
-                        + _curSlippagePercent / 100m
-                        + _curFeePercent / 100m * 2m;
-            if (realStopPct <= 0) { rejectReason = "realStopPct <= 0"; goto LogAndReturn; }
+            ctx.RealStopPct = stopPercent / 100m
+                            + _curSlippagePercent / 100m
+                            + _curFeePercent / 100m * 2m;
+            if (ctx.RealStopPct <= 0) return Reject(ref ctx, "realStopPct <= 0");
 
-            riskPct = side == Side.Buy ? _curVolumeLong : _curVolumeShort;
-            riskMoney = balance * (riskPct / 100m);
-            posSize = riskMoney / realStopPct;
+            ctx.RiskPct = side == Side.Buy ? _curVolumeLong : _curVolumeShort;
+            ctx.RiskMoney = ctx.Balance * (ctx.RiskPct / 100m);
+            ctx.PosSize = ctx.RiskMoney / ctx.RealStopPct;
 
             // --- Инструмент ---
-            sec = _tab.Security;
-            if (sec == null) { rejectReason = "sec == null"; goto LogAndReturn; }
+            ctx.Sec = _tab.Security;
+            if (ctx.Sec == null) return Reject(ref ctx, "sec == null");
 
             if (StartProgram != StartProgram.IsOsOptimizer &&
                 StartProgram != StartProgram.IsTester)
             {
-                if (sec.State != SecurityStateType.Activ)
-                { rejectReason = $"state not active ({sec.State})"; goto LogAndReturn; }
+                if (ctx.Sec.State != SecurityStateType.Activ)
+                    return Reject(ref ctx, $"state not active ({ctx.Sec.State})");
 
-                if (sec.PriceLimitHigh > 0 && entryPrice > sec.PriceLimitHigh)
-                { rejectReason = $"entryPrice {entryPrice} > PriceLimitHigh {sec.PriceLimitHigh}"; goto LogAndReturn; }
+                if (ctx.Sec.PriceLimitHigh > 0 && entryPrice > ctx.Sec.PriceLimitHigh)
+                    return Reject(ref ctx, $"entryPrice {entryPrice} > PriceLimitHigh {ctx.Sec.PriceLimitHigh}");
 
-                if (sec.PriceLimitLow > 0 && entryPrice < sec.PriceLimitLow)
-                { rejectReason = $"entryPrice {entryPrice} < PriceLimitLow {sec.PriceLimitLow}"; goto LogAndReturn; }
+                if (ctx.Sec.PriceLimitLow > 0 && entryPrice < ctx.Sec.PriceLimitLow)
+                    return Reject(ref ctx, $"entryPrice {entryPrice} < PriceLimitLow {ctx.Sec.PriceLimitLow}");
 
-                if ((sec.SecurityType == SecurityType.Futures || sec.SecurityType == SecurityType.Option) &&
-                    sec.Expiration.Year > 1970 &&
-                    sec.Expiration < DateTime.Now)
-                { rejectReason = $"instrument expired (Expiration={sec.Expiration:yyyy-MM-dd})"; goto LogAndReturn; }
+                if ((ctx.Sec.SecurityType == SecurityType.Futures || ctx.Sec.SecurityType == SecurityType.Option) &&
+                    ctx.Sec.Expiration.Year > 1970 &&
+                    ctx.Sec.Expiration < DateTime.Now)
+                    return Reject(ref ctx, $"instrument expired (Expiration={ctx.Sec.Expiration:yyyy-MM-dd})");
 
-                if (sec.SecurityType == SecurityType.Bond &&
-                    sec.MaturityDate != DateTime.MinValue &&
-                    sec.MaturityDate < DateTime.Now.AddDays(_curBondDaysToMaturity))
-                { rejectReason = $"bond maturity too close ({sec.MaturityDate:yyyy-MM-dd})"; goto LogAndReturn; }
+                if (ctx.Sec.SecurityType == SecurityType.Bond &&
+                    ctx.Sec.MaturityDate != DateTime.MinValue &&
+                    ctx.Sec.MaturityDate < DateTime.Now.AddDays(_curBondDaysToMaturity))
+                    return Reject(ref ctx, $"bond maturity too close ({ctx.Sec.MaturityDate:yyyy-MM-dd})");
             }
 
             // --- Расчёт объёма ---
-            decimal mult = sec.DecimalsVolume > 0 ? (decimal)Math.Pow(10, sec.DecimalsVolume) : 1m;
+            decimal mult = ctx.Sec.DecimalsVolume > 0 ? (decimal)Math.Pow(10, ctx.Sec.DecimalsVolume) : 1m;
 
             switch (_modeTrade.ValueString)
             {
                 case "SPOT и LinearPerpetual":
-                    if (sec.SecurityType != SecurityType.CurrencyPair &&
-                        sec.SecurityType != SecurityType.Futures &&
-                        sec.SecurityType != SecurityType.None)
-                    { rejectReason = $"wrong secType for SPOT ({sec.SecurityType})"; goto LogAndReturn; }
+                    if (ctx.Sec.SecurityType != SecurityType.CurrencyPair &&
+                        ctx.Sec.SecurityType != SecurityType.Futures &&
+                        ctx.Sec.SecurityType != SecurityType.None)
+                        return Reject(ref ctx, $"wrong secType for SPOT ({ctx.Sec.SecurityType})");
 
-                    if (sec.UsePriceStepCostToCalculateVolume && sec.PriceStep > 0 && sec.PriceStepCost > 0)
+                    if (ctx.Sec.UsePriceStepCostToCalculateVolume && ctx.Sec.PriceStep > 0 && ctx.Sec.PriceStepCost > 0)
                     {
-                        decimal contractCost = entryPrice / sec.PriceStep * sec.PriceStepCost;
-                        if (contractCost <= 0) { rejectReason = "contractCost <= 0"; goto LogAndReturn; }
-                        volume = Math.Floor(posSize / contractCost * mult) / mult;
+                        decimal contractCost = entryPrice / ctx.Sec.PriceStep * ctx.Sec.PriceStepCost;
+                        if (contractCost <= 0) return Reject(ref ctx, "contractCost <= 0");
+                        ctx.Volume = Math.Floor(ctx.PosSize / contractCost * mult) / mult;
                     }
                     else
                     {
-                        volume = Math.Floor(posSize / entryPrice * mult) / mult;
+                        ctx.Volume = Math.Floor(ctx.PosSize / entryPrice * mult) / mult;
                     }
                     break;
 
                 case "Stocks MOEX":
-                    if (sec.SecurityType != SecurityType.Stock &&
-                        sec.SecurityType != SecurityType.Fund &&
-                        sec.SecurityType != SecurityType.None)
-                    { rejectReason = $"wrong secType for Stocks ({sec.SecurityType})"; goto LogAndReturn; }
-                    if (sec.Lot <= 0) { rejectReason = "Lot <= 0"; goto LogAndReturn; }
+                    if (ctx.Sec.SecurityType != SecurityType.Stock &&
+                        ctx.Sec.SecurityType != SecurityType.Fund &&
+                        ctx.Sec.SecurityType != SecurityType.None)
+                        return Reject(ref ctx, $"wrong secType for Stocks ({ctx.Sec.SecurityType})");
+                    if (ctx.Sec.Lot <= 0) return Reject(ref ctx, "Lot <= 0");
 
-                    volume = Math.Floor(posSize / entryPrice / sec.Lot * mult) / mult;
+                    ctx.Volume = Math.Floor(ctx.PosSize / entryPrice / ctx.Sec.Lot * mult) / mult;
                     break;
 
                 case "Bonds MOEX":
-                    if (sec.SecurityType != SecurityType.Bond &&
-                        sec.SecurityType != SecurityType.None)
-                    { rejectReason = $"wrong secType for Bonds ({sec.SecurityType})"; goto LogAndReturn; }
-                    if (sec.Lot <= 0 || sec.NominalCurrent <= 0)
-                    { rejectReason = $"Lot={sec.Lot} or NominalCurrent={sec.NominalCurrent} <= 0"; goto LogAndReturn; }
+                    if (ctx.Sec.SecurityType != SecurityType.Bond &&
+                        ctx.Sec.SecurityType != SecurityType.None)
+                        return Reject(ref ctx, $"wrong secType for Bonds ({ctx.Sec.SecurityType})");
+                    if (ctx.Sec.Lot <= 0 || ctx.Sec.NominalCurrent <= 0)
+                        return Reject(ref ctx, $"Lot={ctx.Sec.Lot} or NominalCurrent={ctx.Sec.NominalCurrent} <= 0");
 
-                    decimal bondPrice = sec.NominalCurrent * entryPrice / 100m;
-                    if (bondPrice <= 0) { rejectReason = "bondPrice <= 0"; goto LogAndReturn; }
-                    volume = Math.Floor(posSize / bondPrice / sec.Lot * mult) / mult;
+                    decimal bondPrice = ctx.Sec.NominalCurrent * entryPrice / 100m;
+                    if (bondPrice <= 0) return Reject(ref ctx, "bondPrice <= 0");
+                    ctx.Volume = Math.Floor(ctx.PosSize / bondPrice / ctx.Sec.Lot * mult) / mult;
                     break;
 
                 case "InversFutures":
-                    if (sec.SecurityType != SecurityType.Futures &&
-                        sec.SecurityType != SecurityType.None)
-                    { rejectReason = $"wrong secType for InversFutures ({sec.SecurityType})"; goto LogAndReturn; }
-                    if (sec.Lot <= 0) { rejectReason = "Lot <= 0"; goto LogAndReturn; }
+                    if (ctx.Sec.SecurityType != SecurityType.Futures &&
+                        ctx.Sec.SecurityType != SecurityType.None)
+                        return Reject(ref ctx, $"wrong secType for InversFutures ({ctx.Sec.SecurityType})");
+                    if (ctx.Sec.Lot <= 0) return Reject(ref ctx, "Lot <= 0");
 
                     string selectedAsset = _assetNameCurrent.ValueString.ToUpper();
-                    bool isUsdAsset = selectedAsset == "USDT" ||
-                                      selectedAsset == "USDC" ||
-                                      selectedAsset == "USD" ||
-                                      selectedAsset == "RUB" ||
-                                      selectedAsset == "EUR" ||
-                                      selectedAsset == "PRIME";
+                    bool isUsdAsset = selectedAsset == "USDT" || selectedAsset == "USDC" ||
+                                      selectedAsset == "USD" || selectedAsset == "RUB" ||
+                                      selectedAsset == "EUR" || selectedAsset == "PRIME";
                     if (isUsdAsset)
-                    { rejectReason = $"asset '{selectedAsset}' is USD/fiat — укажите базовый крипто-актив (BTC/ETH/...)"; goto LogAndReturn; }
+                        return Reject(ref ctx, $"asset '{selectedAsset}' is USD/fiat — укажите базовый крипто-актив (BTC/ETH/...)");
 
-                    decimal posSizeInverse = balance * entryPrice * (riskPct / 100m) / realStopPct;
-                    volume = Math.Floor(posSizeInverse / sec.Lot * mult) / mult;
+                    decimal posSizeInverse = ctx.Balance * entryPrice * (ctx.RiskPct / 100m) / ctx.RealStopPct;
+                    ctx.Volume = Math.Floor(posSizeInverse / ctx.Sec.Lot * mult) / mult;
                     break;
 
                 case "Futures MOEX":
-                    if (sec.SecurityType != SecurityType.Futures &&
-                        sec.SecurityType != SecurityType.Option &&
-                        sec.SecurityType != SecurityType.None)
-                    { rejectReason = $"wrong secType for FuturesMOEX ({sec.SecurityType})"; goto LogAndReturn; }
-                    if (sec.PriceStep <= 0 || sec.PriceStepCost <= 0 || stopPrice <= 0)
-                    { rejectReason = $"PriceStep={sec.PriceStep} PriceStepCost={sec.PriceStepCost} stopPrice={stopPrice}"; goto LogAndReturn; }
+                    if (ctx.Sec.SecurityType != SecurityType.Futures &&
+                        ctx.Sec.SecurityType != SecurityType.Option &&
+                        ctx.Sec.SecurityType != SecurityType.None)
+                        return Reject(ref ctx, $"wrong secType for FuturesMOEX ({ctx.Sec.SecurityType})");
 
-                    decimal margin = side == Side.Buy ? sec.MarginBuy : sec.MarginSell;
-                    if (margin <= 0) { rejectReason = $"margin <= 0 (MarginBuy={sec.MarginBuy} MarginSell={sec.MarginSell})"; goto LogAndReturn; }
+                    // ВНИМАНИЕ: 'Prime' (portfolio.ValueCurrent) возвращает USD-эквивалент,
+                    // а маржа на MOEX считается в рублях — расчёт будет некорректным.
+                    // Используйте "RUB" в качестве Deposit Asset для Futures MOEX.
+                    if (_assetNameCurrent.ValueString.Equals("Prime", StringComparison.OrdinalIgnoreCase))
+                        return Reject(ref ctx, "asset 'Prime' недопустим для Futures MOEX — укажите 'RUB'");
+
+                    if (ctx.Sec.PriceStep <= 0 || ctx.Sec.PriceStepCost <= 0 || stopPrice <= 0)
+                        return Reject(ref ctx, $"PriceStep={ctx.Sec.PriceStep} PriceStepCost={ctx.Sec.PriceStepCost} stopPrice={stopPrice}");
+
+                    decimal margin = side == Side.Buy ? ctx.Sec.MarginBuy : ctx.Sec.MarginSell;
+                    if (margin <= 0)
+                        return Reject(ref ctx, $"margin <= 0 (MarginBuy={ctx.Sec.MarginBuy} MarginSell={ctx.Sec.MarginSell})");
 
                     decimal stopPts = Math.Abs(entryPrice - stopPrice);
-                    decimal lossPerContract = stopPts / sec.PriceStep * sec.PriceStepCost;
-                    if (lossPerContract <= 0) { rejectReason = "lossPerContract <= 0"; goto LogAndReturn; }
+                    decimal lossPerContract = stopPts / ctx.Sec.PriceStep * ctx.Sec.PriceStepCost;
+                    if (lossPerContract <= 0) return Reject(ref ctx, "lossPerContract <= 0");
 
-                    decimal byRisk = Math.Floor(riskMoney / lossPerContract);
-                    decimal byGo = Math.Floor(balance / margin);
-                    volume = Math.Min(byRisk, byGo);
+                    decimal byRisk = Math.Floor(ctx.RiskMoney / lossPerContract);
+                    decimal byGo = Math.Floor(ctx.Balance / margin);
+                    ctx.Volume = Math.Min(byRisk, byGo);
                     break;
 
                 default:
-                    rejectReason = $"unknown mode '{_modeTrade.ValueString}'";
-                    goto LogAndReturn;
+                    return Reject(ref ctx, $"unknown mode '{_modeTrade.ValueString}'");
             }
 
-            if (volume <= 0) { rejectReason = "volume <= 0 after calculation"; goto LogAndReturn; }
+            if (ctx.Volume <= 0) return Reject(ref ctx, "volume <= 0 after calculation");
 
             // --- Округление по шагу объёма ---
-            if (sec.VolumeStep > 0)
-                volume = Math.Floor(volume / sec.VolumeStep) * sec.VolumeStep;
+            if (ctx.Sec.VolumeStep > 0)
+                ctx.Volume = Math.Floor(ctx.Volume / ctx.Sec.VolumeStep) * ctx.Sec.VolumeStep;
 
             // --- Проверка минимального объёма ---
-            if (sec.MinTradeAmount > 0)
+            if (ctx.Sec.MinTradeAmount > 0)
             {
-                decimal minVolume = sec.MinTradeAmountType == MinTradeAmountType.C_Currency
-                    ? sec.MinTradeAmount / entryPrice
-                    : sec.MinTradeAmount;
+                decimal minVolume = ctx.Sec.MinTradeAmountType == MinTradeAmountType.C_Currency
+                    ? ctx.Sec.MinTradeAmount / entryPrice
+                    : ctx.Sec.MinTradeAmount;
 
-                if (volume < minVolume)
-                { rejectReason = $"volume={volume} < minVolume={minVolume} (MinTradeAmount={sec.MinTradeAmount} type={sec.MinTradeAmountType})"; goto LogAndReturn; }
+                if (ctx.Volume < minVolume)
+                    return Reject(ref ctx, $"volume={ctx.Volume} < minVolume={minVolume} (MinTradeAmount={ctx.Sec.MinTradeAmount} type={ctx.Sec.MinTradeAmountType})");
             }
 
-            LogAndReturn:
+            return LogVolume(ref ctx);
+        }
+
+        // Помечает контекст как отклонённый, логирует и возвращает 0.
+        private decimal Reject(ref VolumeCalcCtx ctx, string reason)
+        {
+            ctx.Volume = 0;
+            ctx.RejectReason = reason;
+            return LogVolume(ref ctx);
+        }
+
+        private decimal LogVolume(ref VolumeCalcCtx ctx)
+        {
             if (_tradeLogOnOff.ValueString == "On")
             {
+                Security s = ctx.Sec;
                 string log =
                 $@" -GET VOLUME DEBUG
-                SECURITY               = {sec?.Name} | TYPE = {sec?.SecurityType} | STATE = {sec?.State}
+                SECURITY               = {s?.Name} | TYPE = {s?.SecurityType} | STATE = {s?.State}
                 MODE                   = {_modeTrade.ValueString}
-                SIDE                   = {side}
+                SIDE                   = {ctx.Side}
                 ------ ASSET / BALANCE ------
                 ASSET                  = {_assetNameCurrent.ValueString}
-                BALANCE                = {balance:F6}
+                BALANCE                = {ctx.Balance:F6}
                 ------ RISK ------
-                RISK PCT               = {riskPct:F4} %
-                RISK MONEY             = {riskMoney:F6}
-                STOP %                 = {stopPercent:F6} %
+                RISK PCT               = {ctx.RiskPct:F4} %
+                RISK MONEY             = {ctx.RiskMoney:F6}
+                STOP %                 = {ctx.StopPercent:F6} %
                 SLIPPAGE %             = {_curSlippagePercent:F4} %
                 FEE %                  = {_curFeePercent:F4} %
-                REAL STOP PCT          = {realStopPct:F6}
-                POS SIZE               = {posSize:F6}
+                REAL STOP PCT          = {ctx.RealStopPct:F6}
+                POS SIZE               = {ctx.PosSize:F6}
                 ------ PRICE ------
-                ENTRY PRICE            = {entryPrice:F4}
-                STOP PRICE             = {stopPrice:F4}
+                ENTRY PRICE            = {ctx.EntryPrice:F4}
+                STOP PRICE             = {ctx.StopPrice:F4}
                 ------ INSTRUMENT ------
-                LOT                    = {sec?.Lot}
-                DECIMALS VOL           = {sec?.DecimalsVolume}
-                VOLUME STEP            = {sec?.VolumeStep}
-                MIN TRADE AMOUNT       = {sec?.MinTradeAmount} ({sec?.MinTradeAmountType})
-                PRICE STEP             = {sec?.PriceStep}
-                STEP COST              = {sec?.PriceStepCost}
-                EXPIRATION             = {sec?.Expiration:yyyy-MM-dd}
-                MARGIN BUY             = {sec?.MarginBuy}
-                MARGIN SELL            = {sec?.MarginSell}
+                LOT                    = {s?.Lot}
+                DECIMALS VOL           = {s?.DecimalsVolume}
+                VOLUME STEP            = {s?.VolumeStep}
+                MIN TRADE AMOUNT       = {s?.MinTradeAmount} ({s?.MinTradeAmountType})
+                PRICE STEP             = {s?.PriceStep}
+                STEP COST              = {s?.PriceStepCost}
+                EXPIRATION             = {s?.Expiration:yyyy-MM-dd}
+                MARGIN BUY             = {s?.MarginBuy}
+                MARGIN SELL            = {s?.MarginSell}
                 ------ RESULT ------
-                VOLUME                 = {volume}
-                REJECT REASON          = {rejectReason}
+                VOLUME                 = {ctx.Volume}
+                REJECT REASON          = {ctx.RejectReason}
                 -";
 
                 SendNewLogMessage(log, Logging.LogMessageType.System);
             }
 
-            return volume;
+            return ctx.Volume;
         }
 
         private decimal GetAssetValue(Portfolio portfolio, string assetName)
