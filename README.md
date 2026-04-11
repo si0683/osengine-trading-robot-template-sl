@@ -32,8 +32,9 @@
 | Поддержка Inverse Futures | ✅ Готово |
 | Поддержка Bonds MOEX | ✅ Готово |
 | Начальный стоп-лосс (CloseAtStop) | ✅ Готово |
-| Трейлинг-стоп (CloseAtTrailingStop) | ⚙️ Заготовка в комментариях — нужно раскомментировать |
+| Трейлинг-стоп (CloseAtTrailingStop) | ⚙️ Заготовка в комментариях — нужно добавить `trailLevel` из индикатора и раскомментировать вызов |
 | Неторговые периоды (по времени и дням) | ✅ Готово |
+| Очистка словаря стопов при неудачном открытии | ✅ Готово |
 | Синхронизация параметров GUI | ✅ Готово |
 | Логирование событий | ✅ Готово |
 | **Торговая логика (сигналы входа/выхода)** | ❌ Ваша реализация |
@@ -105,7 +106,8 @@ TemplateRobot.cs
 │
 ├── LogicOpenPosition         ← TODO: ваши сигналы входа
 ├── LogicClosePosition        ← TODO: ваш трейлинг/выход
-├── SetStopLoss               — автоматически при открытии позиции
+├── SetStopLoss               — автоматически при открытии позиции (PositionOpeningSuccesEvent)
+├── OnOpeningFail             — очистка словаря стопов при неудаче ордера (PositionOpeningFailEvent)
 │
 └── РАСЧЁТ ОБЪЁМА
     ├── CalcVolume(side, entryPrice, stopPrice)
@@ -119,19 +121,16 @@ TemplateRobot.cs
 
 ### Базовые параметры (вкладка "Base")
 
+Параметры регистрируются и отображаются в GUI в следующем порядке:
+
 | Параметр | Тип | По умолчанию | Описание |
 |---|---|---|---|
+| `Non trade periods` | button | — | Открыть диалог настройки неторговых периодов |
 | `Regime` | string | `Off` | Режим работы робота |
 | `Time zone UTC` | int | `4` | Часовой пояс для неторговых периодов |
-| `Non trade periods` | button | — | Открыть диалог настройки неторговых периодов |
-| `Trade debug log` | string | `Off` | Подробный лог расчёта объёма (`On` / `Off`) |
-
-### Параметры объёма (вкладка "Base")
-
-| Параметр | Тип | По умолчанию | Описание |
-|---|---|---|---|
 | `Trade Section` | string | `SPOT и LinearPerpetual` | Тип торгуемого инструмента |
 | `Deposit Asset` | string | `USDT` | Валюта депозита для расчёта риска |
+| `Trade debug log` | string | `Off` | Подробный лог расчёта объёма (`On` / `Off`) |
 | `Volume Long (%)` | decimal | `2.5` | Риск на одну сделку лонг, % от депозита |
 | `Volume Short (%)` | decimal | `2.5` | Риск на одну сделку шорт, % от депозита |
 | `Slippage (%)` | decimal | `0.1` | Проскальзывание, % от цены входа |
@@ -162,7 +161,7 @@ decimal volume = CalcVolume(Side.Buy, entry, stopPrice);
 if (volume <= 0) return;  // риск-менеджер не пропускает сделку
 
 Position pos = _tab.BuyAtLimit(volume, entry);
-_stopByOrderId[pos.OpenOrders[0].NumberUser] = stopPrice;
+_stopByOrderId.TryAdd(pos.OpenOrders[0].NumberUser, stopPrice);
 ```
 
 ### Поддерживаемые секции
@@ -188,9 +187,9 @@ OsEngine работает в двух потоках одновременно:
 
 Если хранить цену стопа в поле класса (`_stopPrice`), при нескольких одновременных позициях значение из одной сделки перезапишет значение другой — это и есть **гонка состояний (race condition)**. В результате стоп выставляется по неверной цене или не выставляется вовсе.
 
-### Решение — словарь `_stopByOrderId`
+### Решение — `ConcurrentDictionary<int, decimal> _stopByOrderId`
 
-Шаблон использует `Dictionary<int, decimal>`, где **ключ — `NumberUser` ордера на вход**, а значение — цена стопа, рассчитанная именно для этой заявки.
+Шаблон использует `ConcurrentDictionary<int, decimal>`, где **ключ — `NumberUser` ордера на вход**, а значение — цена стопа, рассчитанная именно для этой заявки. `ConcurrentDictionary` обеспечивает потокобезопасность без явных `lock`-ов — это принципиальное отличие от обычного `Dictionary`.
 
 ```
 Синхронно (CandleFinishedEvent)          Асинхронно (PositionOpeningSuccesEvent)
@@ -198,10 +197,10 @@ OsEngine работает в двух потоках одновременно:
 1. Рассчитать stopPrice                  4. Биржа подтвердила исполнение
 2. BuyAtLimit → получить pos             5. SetStopLoss(pos) вызван движком
 3. Записать:                             6. Прочитать:
-   _stopByOrderId[                          _stopByOrderId.TryGetValue(
-     pos.OpenOrders[0].NumberUser             pos.OpenOrders[0].NumberUser,
-   ] = stopPrice;                             out decimal stopPrice)
-                                          7. Удалить ключ из словаря
+   _stopByOrderId.TryAdd(                   _stopByOrderId.TryGetValue(
+     pos.OpenOrders[0].NumberUser,            pos.OpenOrders[0].NumberUser,
+     stopPrice)                               out decimal stopPrice)
+                                          7. Удалить ключ из словаря (TryRemove)
                                           8. CloseAtStop(pos, stopPrice, ...)
 ```
 
@@ -214,20 +213,20 @@ OsEngine работает в двух потоках одновременно:
 ```csharp
 // Синхронно — после выставления ордера
 Position pos = _tab.BuyAtLimit(volume, entry + slippage);
-_stopByOrderId[pos.OpenOrders[0].NumberUser] = stopPrice;
+_stopByOrderId.TryAdd(pos.OpenOrders[0].NumberUser, stopPrice);
 
 // Асинхронно — когда биржа подтвердила
 private void SetStopLoss(Position pos)
 {
-    int key = pos.OpenOrders[0].NumberUser;
+    int orderKey = pos.OpenOrders[0].NumberUser;
 
-    if (!_stopByOrderId.TryGetValue(key, out decimal stopPrice) || stopPrice <= 0)
+    if (!_stopByOrderId.TryGetValue(orderKey, out decimal stopPrice) || stopPrice <= 0)
     {
         SendNewLogMessage($"[STOP] Стоп не найден для pos#{pos.Number}", LogMessageType.Error);
         return;
     }
 
-    _stopByOrderId.Remove(key);  // удаляем только этот ключ
+    _stopByOrderId.TryRemove(orderKey, out _);  // удаляем только этот ключ
 
     decimal slippage = stopPrice * (_curSlippagePercent / 100m);
     _tab.CloseAtStop(pos, stopPrice, stopPrice - slippage);  // для лонга
@@ -246,12 +245,33 @@ if (pos.StopOrderRedLine > 0)
 }
 ```
 
+### Очистка словаря при неудачном открытии
+
+Если ордер на открытие отклонён биржей или отменён до исполнения, `PositionOpeningSuccesEvent` не вызывается и `SetStopLoss` не срабатывает. Чтобы запись в словаре не осталась навсегда, предусмотрен обработчик `OnOpeningFail`:
+
+```csharp
+private void OnOpeningFail(Position pos)
+{
+    if (pos.OpenOrders == null || pos.OpenOrders.Count == 0) return;
+
+    int orderKey = pos.OpenOrders[0].NumberUser;
+
+    if (_stopByOrderId.TryRemove(orderKey, out _))
+    {
+        SendNewLogMessage(
+            $"[STOP] Стоп удалён из словаря (OpeningFail) orderKey={orderKey} pos#{pos.Number}",
+            LogMessageType.System);
+    }
+}
+```
+
 ### Итог
 
-| Подход | Гонка состояний | Несколько позиций |
-|---|---|---|
-| Поле класса `_stopPrice` | ❌ Есть | ❌ Стопы перемешиваются |
-| Словарь `_stopByOrderId` | ✅ Нет | ✅ Каждая позиция — свой стоп |
+| Подход | Гонка состояний | Несколько позиций | Утечка при неудаче |
+|---|---|---|---|
+| Поле класса `_stopPrice` | ❌ Есть | ❌ Стопы перемешиваются | — |
+| `Dictionary<int, decimal>` | ⚠️ Нужен `lock` | ✅ Каждая позиция — свой стоп | ❌ Без `OnOpeningFail` |
+| `ConcurrentDictionary` + `OnOpeningFail` | ✅ Нет | ✅ Каждая позиция — свой стоп | ✅ Нет |
 
 ---
 
@@ -360,7 +380,7 @@ private void LogicOpenPosition(List<Candle> candles)
                 return;
             }
 
-            _stopByOrderId[pos.OpenOrders[0].NumberUser] = stopPrice;
+            _stopByOrderId.TryAdd(pos.OpenOrders[0].NumberUser, stopPrice);
             SendNewLogMessage($"[OPEN] BUY | entry≈{entry:F4} stop={stopPrice:F4} vol={volume}", LogMessageType.System);
         }
     }
@@ -369,25 +389,29 @@ private void LogicOpenPosition(List<Candle> candles)
 
 ### Шаг 5 — Реализовать трейлинг-выход
 
-В методе `LogicClosePosition()`:
+В методе `LogicClosePosition()` нужно получить уровень трейлинга из индикатора и раскомментировать вызов `CloseAtTrailingStop`:
 
 ```csharp
 private void LogicClosePosition(List<Candle> candles)
 {
     List<Position> openPositions = _tab.PositionsOpenAll;
 
-    decimal trailLevel = _ema.DataSeries[0].Last;  // трейлинг по EMA
+    decimal trailLong  = _ema.DataSeries[0].Last;  // трейлинг для лонга
+    decimal trailShort = _ema.DataSeries[0].Last;  // трейлинг для шорта
 
     for (int i = 0; openPositions != null && i < openPositions.Count; i++)
     {
         Position pos = openPositions[i];
         if (pos.State != PositionStateType.Open) continue;
 
-        if (pos.Direction == Side.Buy && trailLevel > pos.EntryPrice)
-        {
-            // Прибыль защищена — переходим на трейлинг
+        decimal trailLevel = pos.Direction == Side.Buy ? trailLong : trailShort;
+
+        bool trailIsBetter = pos.Direction == Side.Buy
+            ? trailLevel > pos.EntryPrice
+            : trailLevel < pos.EntryPrice;
+
+        if (trailIsBetter)
             _tab.CloseAtTrailingStop(pos, trailLevel, trailLevel);
-        }
     }
 }
 ```
@@ -411,6 +435,7 @@ private void LogicClosePosition(List<Candle> candles)
 - [OsEngine](https://github.com/AlexWan/OsEngine) актуальной версии
 - .NET Framework / .NET совместимый с вашей версией OsEngine
 - C# 7.0+
+- `using System.Collections.Concurrent` — используется для `ConcurrentDictionary`
 
 ---
 
