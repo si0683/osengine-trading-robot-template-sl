@@ -309,36 +309,24 @@ namespace OsEngine.Robots
         // ════════════════════════════════════════════════════════════════════════════
         //   ЛОГИКА ЗАКРЫТИЯ — TODO: реализовать
         //
-        //   Фаза 1 — трейлинг-уровень ещё хуже цены входа:
-        //     Держим фиксированный стоп из SetStopLoss (CloseAtStop).
-        //
-        //   Фаза 2 — трейлинг-уровень лучше цены входа (прибыль защищена):
-        //     Переключаемся на CloseAtTrailingStop, который перезаписывает
-        //     фиксированный стоп и двигает его вслед за ценой.
+        //   Начальный стоп выставляется автоматически в SetStopLoss при открытии.
+        //   Здесь можно добавить дополнительные условия выхода по сигналу индикатора:
+        //   например, CloseAtMarket или CloseAtLimit при появлении сигнала разворота.
         // ════════════════════════════════════════════════════════════════════════════
 
         private void LogicClosePosition(List<Candle> candles)
         {
             List<Position> openPositions = _tab.PositionsOpenAll;
 
-            // TODO: получить уровни трейлинга из индикатора
-            // decimal trailLong  = /* уровень стопа для лонга  */;
-            // decimal trailShort = /* уровень стопа для шорта */;
-
             for (int i = 0; openPositions != null && i < openPositions.Count; i++)
             {
                 Position pos = openPositions[i];
                 if (pos.State != PositionStateType.Open) continue;
 
-                // TODO: выбрать нужный трейлинг-уровень по направлению позиции
-                // decimal trailLevel = pos.Direction == Side.Buy ? trailLong : trailShort;
-
-                // bool trailIsBetter = pos.Direction == Side.Buy
-                //     ? trailLevel > pos.EntryPrice
-                //     : trailLevel < pos.EntryPrice;
-
-                // if (trailIsBetter)
-                //     _tab.CloseAtTrailingStop(pos, trailLevel, trailLevel);
+                // TODO: добавить условия выхода по сигналу
+                // Например:
+                // if (pos.Direction == Side.Buy && /* сигнал разворота */ )
+                //     _tab.CloseAtMarket(pos, pos.OpenVolume);
             }
         }
 
@@ -348,8 +336,7 @@ namespace OsEngine.Robots
         //   Вызывается АСИНХРОННО из PositionOpeningSuccesEvent когда позиция
         //   переходит в состояние Open — биржа подтвердила исполнение.
         //
-        //   Выставляет НАЧАЛЬНЫЙ стоп по цене, рассчитанной в момент входа.
-        //   Далее LogicClosePosition двигает его через CloseAtTrailingStop.
+        //   Выставляет стоп по цене, рассчитанной в момент входа.
         //
         //   Стоп находится по pos.OpenOrders[0].NumberUser — тому же ключу, под
         //   которым он был сохранён синхронно в LogicOpenPosition после BuyAtLimit.
