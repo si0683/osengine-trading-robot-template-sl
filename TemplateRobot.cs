@@ -674,11 +674,7 @@ namespace OsEngine.Robots
             if (portfolio == null) return 0;
 
             // Prime = суммарная стоимость портфеля в валюте счёта (деньги + открытые позиции).
-            // Подходит для SPOT / LinearPerpetual, где баланс и позиции в одной валюте.
-            // Для MOEX (Stocks, Bonds, Futures) использовать нельзя: нужен денежный остаток ("RUB"),
-            // а не суммарная стоимость счёта вместе с позициями.
-            // Для InversFutures указывать конкретный базовый актив (например BTC),
-            // так как формула умножает balance на entryPrice.
+            // Вы можете выбрать как Prime, так и конкретный актив — например, USDT. В первом случае объём будет рассчитываться от всего портфеля, во втором — от стоимости только этого актива!
             if (assetName == "Prime") return portfolio.ValueCurrent;
 
             List<PositionOnBoard> positions = portfolio.GetPositionOnBoard();
