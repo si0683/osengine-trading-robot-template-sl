@@ -454,6 +454,8 @@ namespace OsEngine.Robots
             // --- Входные параметры ---
             if (stopPercent <= 0) return Reject(ref ctx, "stopPercent <= 0");
             if (entryPrice <= 0) return Reject(ref ctx, "entryPrice <= 0");
+            if (stopPrice <= 0 && _modeTrade.ValueString == "Futures MOEX")
+                return Reject(ref ctx, "stopPrice <= 0");
 
             // --- Баланс ---
             ctx.Balance = GetAssetValue(_tab.Portfolio, _assetNameCurrent.ValueString);
@@ -463,6 +465,8 @@ namespace OsEngine.Robots
             ctx.RealStopPct = stopPercent / 100m
                             + _curSlippagePercent / 100m
                             + _curFeePercent / 100m * 2m;
+            // realStopPct не может быть <= 0 при валидных входных данных,
+            // но оставляем как страховку от некорректных настроек слиппаджа/комиссии
             if (ctx.RealStopPct <= 0) return Reject(ref ctx, "realStopPct <= 0");
 
             ctx.RiskPct = side == Side.Buy ? _curVolumeLong : _curVolumeShort;
@@ -497,6 +501,10 @@ namespace OsEngine.Robots
             }
 
             // --- Расчёт объёма ---
+            // ВНИМАНИЕ: 'Prime' возвращает суммарную стоимость портфеля (деньги + позиции).
+            // Для расчёта риска нужен только денежный остаток — укажите "RUB".
+            bool isPrimeAsset = _assetNameCurrent.ValueString.Equals("Prime", StringComparison.OrdinalIgnoreCase);
+
             decimal mult = ctx.Sec.DecimalsVolume > 0 ? (decimal)Math.Pow(10, ctx.Sec.DecimalsVolume) : 1m;
 
             switch (_modeTrade.ValueString)
@@ -524,9 +532,7 @@ namespace OsEngine.Robots
                         ctx.Sec.SecurityType != SecurityType.Fund &&
                         ctx.Sec.SecurityType != SecurityType.None)
                         return Reject(ref ctx, $"wrong secType for Stocks ({ctx.Sec.SecurityType})");
-                    // ВНИМАНИЕ: 'Prime' возвращает суммарную стоимость портфеля (деньги + позиции).
-                    // Для расчёта риска нужен только денежный остаток — укажите "RUB".
-                    if (_assetNameCurrent.ValueString.Equals("Prime", StringComparison.OrdinalIgnoreCase))
+                    if (isPrimeAsset)
                         return Reject(ref ctx, "asset 'Prime' недопустим для Stocks MOEX — укажите 'RUB' (денежный остаток)");
                     if (ctx.Sec.Lot <= 0) return Reject(ref ctx, "Lot <= 0");
 
@@ -537,9 +543,7 @@ namespace OsEngine.Robots
                     if (ctx.Sec.SecurityType != SecurityType.Bond &&
                         ctx.Sec.SecurityType != SecurityType.None)
                         return Reject(ref ctx, $"wrong secType for Bonds ({ctx.Sec.SecurityType})");
-                    // ВНИМАНИЕ: 'Prime' возвращает суммарную стоимость портфеля (деньги + позиции).
-                    // Для расчёта риска нужен только денежный остаток — укажите "RUB".
-                    if (_assetNameCurrent.ValueString.Equals("Prime", StringComparison.OrdinalIgnoreCase))
+                    if (isPrimeAsset)
                         return Reject(ref ctx, "asset 'Prime' недопустим для Bonds MOEX — укажите 'RUB' (денежный остаток)");
                     if (ctx.Sec.Lot <= 0 || ctx.Sec.NominalCurrent <= 0)
                         return Reject(ref ctx, $"Lot={ctx.Sec.Lot} or NominalCurrent={ctx.Sec.NominalCurrent} <= 0");
@@ -562,6 +566,8 @@ namespace OsEngine.Robots
                     if (isUsdAsset)
                         return Reject(ref ctx, $"asset '{selectedAsset}' is USD/fiat — укажите базовый крипто-актив (BTC/ETH/...)");
 
+                    // Для инверсного фьючерса PnL номинирован в базовом активе (BTC/ETH/...),
+                    // поэтому формула отличается от обычной: размер позиции умножается на цену входа.
                     decimal posSizeInverse = ctx.Balance * entryPrice * (ctx.RiskPct / 100m) / ctx.RealStopPct;
                     ctx.Volume = Math.Floor(posSizeInverse / ctx.Sec.Lot * mult) / mult;
                     break;
@@ -571,14 +577,10 @@ namespace OsEngine.Robots
                         ctx.Sec.SecurityType != SecurityType.Option &&
                         ctx.Sec.SecurityType != SecurityType.None)
                         return Reject(ref ctx, $"wrong secType for FuturesMOEX ({ctx.Sec.SecurityType})");
-
-                    // ВНИМАНИЕ: 'Prime' возвращает суммарную стоимость портфеля (деньги + позиции).
-                    // Для расчёта риска нужен только денежный остаток — укажите "RUB".
-                    if (_assetNameCurrent.ValueString.Equals("Prime", StringComparison.OrdinalIgnoreCase))
+                    if (isPrimeAsset)
                         return Reject(ref ctx, "asset 'Prime' недопустим для Futures MOEX — укажите 'RUB' (денежный остаток)");
-
-                    if (ctx.Sec.PriceStep <= 0 || ctx.Sec.PriceStepCost <= 0 || stopPrice <= 0)
-                        return Reject(ref ctx, $"PriceStep={ctx.Sec.PriceStep} PriceStepCost={ctx.Sec.PriceStepCost} stopPrice={stopPrice}");
+                    if (ctx.Sec.PriceStep <= 0 || ctx.Sec.PriceStepCost <= 0)
+                        return Reject(ref ctx, $"PriceStep={ctx.Sec.PriceStep} PriceStepCost={ctx.Sec.PriceStepCost}");
 
                     decimal margin = side == Side.Buy ? ctx.Sec.MarginBuy : ctx.Sec.MarginSell;
                     if (margin <= 0)
