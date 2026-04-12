@@ -501,15 +501,12 @@ namespace OsEngine.Robots
             }
 
             // --- Расчёт объёма ---
-            // ВНИМАНИЕ: 'Prime' возвращает суммарную стоимость портфеля (деньги + позиции).
-            // Для расчёта риска нужен только денежный остаток — укажите "RUB".
-            bool isPrimeAsset = _assetNameCurrent.ValueString.Equals("Prime", StringComparison.OrdinalIgnoreCase);
-
             decimal mult = ctx.Sec.DecimalsVolume > 0 ? (decimal)Math.Pow(10, ctx.Sec.DecimalsVolume) : 1m;
 
             switch (_modeTrade.ValueString)
             {
                 case "SPOT и LinearPerpetual":
+                    // Prime разрешён — торговля от суммарного портфеля допустима для крипты
                     if (ctx.Sec.SecurityType != SecurityType.CurrencyPair &&
                         ctx.Sec.SecurityType != SecurityType.Futures &&
                         ctx.Sec.SecurityType != SecurityType.None)
@@ -528,23 +525,21 @@ namespace OsEngine.Robots
                     break;
 
                 case "Stocks MOEX":
+                    // Prime разрешён — пользователь осознанно торгует от суммарного портфеля
                     if (ctx.Sec.SecurityType != SecurityType.Stock &&
                         ctx.Sec.SecurityType != SecurityType.Fund &&
                         ctx.Sec.SecurityType != SecurityType.None)
                         return Reject(ref ctx, $"wrong secType for Stocks ({ctx.Sec.SecurityType})");
-                    if (isPrimeAsset)
-                        return Reject(ref ctx, "asset 'Prime' недопустим для Stocks MOEX — укажите 'RUB' (денежный остаток)");
                     if (ctx.Sec.Lot <= 0) return Reject(ref ctx, "Lot <= 0");
 
                     ctx.Volume = Math.Floor(ctx.PosSize / entryPrice / ctx.Sec.Lot * mult) / mult;
                     break;
 
                 case "Bonds MOEX":
+                    // Prime разрешён — пользователь осознанно торгует от суммарного портфеля
                     if (ctx.Sec.SecurityType != SecurityType.Bond &&
                         ctx.Sec.SecurityType != SecurityType.None)
                         return Reject(ref ctx, $"wrong secType for Bonds ({ctx.Sec.SecurityType})");
-                    if (isPrimeAsset)
-                        return Reject(ref ctx, "asset 'Prime' недопустим для Bonds MOEX — укажите 'RUB' (денежный остаток)");
                     if (ctx.Sec.Lot <= 0 || ctx.Sec.NominalCurrent <= 0)
                         return Reject(ref ctx, $"Lot={ctx.Sec.Lot} or NominalCurrent={ctx.Sec.NominalCurrent} <= 0");
 
@@ -560,6 +555,7 @@ namespace OsEngine.Robots
                     if (ctx.Sec.Lot <= 0) return Reject(ref ctx, "Lot <= 0");
 
                     string selectedAsset = _assetNameCurrent.ValueString.ToUpper();
+                    // Prime запрещён вместе с fiat-активами — баланс должен быть в базовом крипто-активе
                     bool isUsdAsset = selectedAsset == "USDT" || selectedAsset == "USDC" ||
                                       selectedAsset == "USD" || selectedAsset == "RUB" ||
                                       selectedAsset == "EUR" || selectedAsset == "PRIME";
@@ -577,7 +573,8 @@ namespace OsEngine.Robots
                         ctx.Sec.SecurityType != SecurityType.Option &&
                         ctx.Sec.SecurityType != SecurityType.None)
                         return Reject(ref ctx, $"wrong secType for FuturesMOEX ({ctx.Sec.SecurityType})");
-                    if (isPrimeAsset)
+                    // Prime запрещён — для расчёта ГО нужен только денежный остаток, укажите 'RUB'
+                    if (_assetNameCurrent.ValueString.Equals("Prime", StringComparison.OrdinalIgnoreCase))
                         return Reject(ref ctx, "asset 'Prime' недопустим для Futures MOEX — укажите 'RUB' (денежный остаток)");
                     if (ctx.Sec.PriceStep <= 0 || ctx.Sec.PriceStepCost <= 0)
                         return Reject(ref ctx, $"PriceStep={ctx.Sec.PriceStep} PriceStepCost={ctx.Sec.PriceStepCost}");
