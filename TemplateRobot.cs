@@ -454,6 +454,8 @@ namespace OsEngine.Robots
             // --- Входные параметры ---
             if (stopPercent <= 0) return Reject(ref ctx, "stopPercent <= 0");
             if (entryPrice <= 0) return Reject(ref ctx, "entryPrice <= 0");
+            if (stopPrice <= 0 && _modeTrade.ValueString == "Futures MOEX")
+                return Reject(ref ctx, "stopPrice <= 0");
 
             // --- Баланс ---
             ctx.Balance = GetAssetValue(_tab.Portfolio, _assetNameCurrent.ValueString);
@@ -577,8 +579,8 @@ namespace OsEngine.Robots
                         return Reject(ref ctx, $"wrong secType for FuturesMOEX ({ctx.Sec.SecurityType})");
                     if (isPrimeAsset)
                         return Reject(ref ctx, "asset 'Prime' недопустим для Futures MOEX — укажите 'RUB' (денежный остаток)");
-                    if (ctx.Sec.PriceStep <= 0 || ctx.Sec.PriceStepCost <= 0 || stopPrice <= 0)
-                        return Reject(ref ctx, $"PriceStep={ctx.Sec.PriceStep} PriceStepCost={ctx.Sec.PriceStepCost} stopPrice={stopPrice}");
+                    if (ctx.Sec.PriceStep <= 0 || ctx.Sec.PriceStepCost <= 0)
+                        return Reject(ref ctx, $"PriceStep={ctx.Sec.PriceStep} PriceStepCost={ctx.Sec.PriceStepCost}");
 
                     decimal margin = side == Side.Buy ? ctx.Sec.MarginBuy : ctx.Sec.MarginSell;
                     if (margin <= 0)
