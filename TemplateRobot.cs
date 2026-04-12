@@ -506,7 +506,6 @@ namespace OsEngine.Robots
             switch (_modeTrade.ValueString)
             {
                 case "SPOT и LinearPerpetual":
-                    // Prime разрешён — торговля от суммарного портфеля допустима для крипты
                     if (ctx.Sec.SecurityType != SecurityType.CurrencyPair &&
                         ctx.Sec.SecurityType != SecurityType.Futures &&
                         ctx.Sec.SecurityType != SecurityType.None)
@@ -525,7 +524,6 @@ namespace OsEngine.Robots
                     break;
 
                 case "Stocks MOEX":
-                    // Prime разрешён — пользователь осознанно торгует от суммарного портфеля
                     if (ctx.Sec.SecurityType != SecurityType.Stock &&
                         ctx.Sec.SecurityType != SecurityType.Fund &&
                         ctx.Sec.SecurityType != SecurityType.None)
@@ -536,7 +534,6 @@ namespace OsEngine.Robots
                     break;
 
                 case "Bonds MOEX":
-                    // Prime разрешён — пользователь осознанно торгует от суммарного портфеля
                     if (ctx.Sec.SecurityType != SecurityType.Bond &&
                         ctx.Sec.SecurityType != SecurityType.None)
                         return Reject(ref ctx, $"wrong secType for Bonds ({ctx.Sec.SecurityType})");
