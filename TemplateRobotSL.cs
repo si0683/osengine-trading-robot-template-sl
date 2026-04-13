@@ -32,8 +32,8 @@ slippage and commission. Supports SPOT / LinearPerpetual, Stocks MOEX, InversFut
 
 namespace OsEngine.Robots
 {
-    [Bot("TemplateRobot")]
-    public class TemplateRobot : BotPanel
+    [Bot("TemplateRobotSL")]
+    public class TemplateRobotSL : BotPanel
     {
         // ── Вкладка ──────────────────────────────────────────────────────────────────
         private readonly BotTabSimple _tab;
@@ -87,7 +87,7 @@ namespace OsEngine.Robots
         //   КОНСТРУКТОР
         // ════════════════════════════════════════════════════════════════════════════
 
-        public TemplateRobot(string name, StartProgram startProgram) : base(name, startProgram)
+        public TemplateRobotSL(string name, StartProgram startProgram) : base(name, startProgram)
         {
             _tradePeriods = new NonTradePeriods(name);
             _tradePeriods.NonTradePeriodGeneral.NonTradePeriod1Start = new TimeOfDay { Hour = 0, Minute = 0 };
@@ -151,7 +151,7 @@ namespace OsEngine.Robots
         //   ОБЯЗАТЕЛЬНЫЕ ПЕРЕГРУЗКИ
         // ════════════════════════════════════════════════════════════════════════════
 
-        public override string GetNameStrategyType() => "TemplateRobot";
+        public override string GetNameStrategyType() => "TemplateRobotSL";
 
         public override void ShowIndividualSettingsDialog() { }
 
