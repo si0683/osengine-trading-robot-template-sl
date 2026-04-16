@@ -666,6 +666,7 @@ namespace OsEngine.Robots
                 DECIMALS VOL           = {s?.DecimalsVolume}
                 VOLUME STEP            = {s?.VolumeStep}
                 MIN TRADE AMOUNT       = {s?.MinTradeAmount} ({s?.MinTradeAmountType})
+                MIN VOLUME TESTER      = {_curMinVolumeTester}
                 PRICE STEP             = {s?.PriceStep}
                 STEP COST              = {s?.PriceStepCost}
                 EXPIRATION             = {s?.Expiration:yyyy-MM-dd}
