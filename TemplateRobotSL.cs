@@ -125,7 +125,7 @@ namespace OsEngine.Robots
             _tradeLogOnOff = CreateParameter("Trade debug log", "Off", new[] { "On", "Off" }, "Base");
             _volumeLong = CreateParameter("Volume Long (%)", 2.5m, 0.1m, 50m, 0.1m, "Base");
             _volumeShort = CreateParameter("Volume Short (%)", 2.5m, 0.1m, 50m, 0.1m, "Base");
-            _minVolumeTester = CreateParameter("Min Volume (Tester)", 0m, 0m, 1000m, 0.01m, "Base");
+            _minVolumeTester = CreateParameter("Min LOT (Tester)", 0m, 0m, 1000m, 0.01m, "Base");
             _slippagePercent = CreateParameter("Slippage (%)", 0.1m, 0.01m, 2m, 0.01m, "Base");
             _feePercent = CreateParameter("Fee (%)", 0.1m, 0.01m, 1m, 0.01m, "Base");
             _bondDaysToMaturity = CreateParameter("Bond days to maturity", 30, 1, 365, 1, "Base");
@@ -665,8 +665,8 @@ namespace OsEngine.Robots
                 LOT                    = {s?.Lot}
                 DECIMALS VOL           = {s?.DecimalsVolume}
                 VOLUME STEP            = {s?.VolumeStep}
-                MIN TRADE AMOUNT       = {s?.MinTradeAmount} ({s?.MinTradeAmountType})
-                MIN VOLUME TESTER      = {_curMinVolumeTester}
+                MIN TRADE (LOT) AMOUNT = {s?.MinTradeAmount} ({s?.MinTradeAmountType})
+                MIN (LOT) TESTER = {_curMinVolumeTester}
                 PRICE STEP             = {s?.PriceStep}
                 STEP COST              = {s?.PriceStepCost}
                 EXPIRATION             = {s?.Expiration:yyyy-MM-dd}
