@@ -46,6 +46,7 @@ namespace OsEngine.Robots
         private readonly StrategyParameterString _assetNameCurrent;
         private readonly StrategyParameterDecimal _volumeLong;
         private readonly StrategyParameterDecimal _volumeShort;
+        private readonly StrategyParameterDecimal _minVolumeTester;
         private readonly StrategyParameterDecimal _slippagePercent;
         private readonly StrategyParameterDecimal _feePercent;
         private readonly StrategyParameterInt _bondDaysToMaturity;
@@ -66,6 +67,7 @@ namespace OsEngine.Robots
         // Синхронизированные копии параметров GUI (обновляются через SyncParams)
         private decimal _curVolumeLong;
         private decimal _curVolumeShort;
+        private decimal _curMinVolumeTester;
         private decimal _curSlippagePercent;
         private decimal _curFeePercent;
         private int _curBondDaysToMaturity;
@@ -123,6 +125,7 @@ namespace OsEngine.Robots
             _tradeLogOnOff = CreateParameter("Trade debug log", "Off", new[] { "On", "Off" }, "Base");
             _volumeLong = CreateParameter("Volume Long (%)", 2.5m, 0.1m, 50m, 0.1m, "Base");
             _volumeShort = CreateParameter("Volume Short (%)", 2.5m, 0.1m, 50m, 0.1m, "Base");
+            _minVolumeTester = CreateParameter("Min Volume (Tester)", 0m, 0m, 1000m, 0.01m, "Base");
             _slippagePercent = CreateParameter("Slippage (%)", 0.1m, 0.01m, 2m, 0.01m, "Base");
             _feePercent = CreateParameter("Fee (%)", 0.1m, 0.01m, 1m, 0.01m, "Base");
             _bondDaysToMaturity = CreateParameter("Bond days to maturity", 30, 1, 365, 1, "Base");
@@ -179,6 +182,7 @@ namespace OsEngine.Robots
         {
             _curVolumeLong = _volumeLong.ValueDecimal;
             _curVolumeShort = _volumeShort.ValueDecimal;
+            _curMinVolumeTester = _minVolumeTester.ValueDecimal;
             _curSlippagePercent = _slippagePercent.ValueDecimal;
             _curFeePercent = _feePercent.ValueDecimal;
             _curTimeZoneUtc = _timeZoneUtc.ValueInt;
@@ -423,7 +427,7 @@ namespace OsEngine.Robots
         }
 
         // Контекст одного вызова GetVolume: накапливает промежуточные значения для лога.
-     
+
         private struct VolumeCalcCtx
         {
             public Side Side;
@@ -600,14 +604,26 @@ namespace OsEngine.Robots
                 ctx.Volume = Math.Floor(ctx.Volume / ctx.Sec.VolumeStep) * ctx.Sec.VolumeStep;
 
             // --- Проверка минимального объёма ---
-            if (ctx.Sec.MinTradeAmount > 0)
+            if (StartProgram == StartProgram.IsOsOptimizer ||
+                StartProgram == StartProgram.IsTester)
             {
-                decimal minVolume = ctx.Sec.MinTradeAmountType == MinTradeAmountType.C_Currency
-                    ? ctx.Sec.MinTradeAmount / entryPrice
-                    : ctx.Sec.MinTradeAmount;
+                // В тестере/оптимизаторе ctx.Sec.MinTradeAmount недоступен —
+                // используем параметр «Min Volume (Tester)» (0 = проверка отключена).
+                if (_curMinVolumeTester > 0 && ctx.Volume < _curMinVolumeTester)
+                    return Reject(ref ctx, $"volume={ctx.Volume} < minVolumeTester={_curMinVolumeTester}");
+            }
+            else
+            {
+                // Реальный рынок: берём MinTradeAmount из инструмента.
+                if (ctx.Sec.MinTradeAmount > 0)
+                {
+                    decimal minVolume = ctx.Sec.MinTradeAmountType == MinTradeAmountType.C_Currency
+                        ? ctx.Sec.MinTradeAmount / entryPrice
+                        : ctx.Sec.MinTradeAmount;
 
-                if (ctx.Volume < minVolume)
-                    return Reject(ref ctx, $"volume={ctx.Volume} < minVolume={minVolume} (MinTradeAmount={ctx.Sec.MinTradeAmount} type={ctx.Sec.MinTradeAmountType})");
+                    if (ctx.Volume < minVolume)
+                        return Reject(ref ctx, $"volume={ctx.Volume} < minVolume={minVolume} (MinTradeAmount={ctx.Sec.MinTradeAmount} type={ctx.Sec.MinTradeAmountType})");
+                }
             }
 
             return LogVolume(ref ctx);
