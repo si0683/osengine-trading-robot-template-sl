@@ -1,6 +1,6 @@
-# TemplateRobotSL — Шаблон торгового робота для OsEngine
+# TemplateRobotAdvanced — Продвинутый шаблон торгового робота для OsEngine
 
-Готовый шаблон для создания собственного торгового робота на платформе [OsEngine](https://github.com/AlexWan/OsEngine). Содержит полную инфраструктуру: управление объёмом с учётом риска, неторговые периоды, стоп-лосс. Вам остаётся только добавить свою торговую логику.
+Готовый шаблон для создания собственного торгового робота на платформе [OsEngine](https://github.com/AlexWan/OsEngine). Содержит полную инфраструктуру: управление объёмом с учётом риска, стоп-лосс, тейк-профит, трейлинг-стоп, неторговые периоды, все события `BotTabSimple`. Вам остаётся только добавить свою торговую логику.
 
 ---
 
@@ -11,12 +11,13 @@
 - [Структура файла](#структура-файла)
 - [Параметры робота](#параметры-робота)
 - [Расчёт объёма](#расчёт-объёма)
-- [Стоп-лосс на каждую позицию без гонки состояний](#стоп-лосс-на-каждую-позицию-без-гонки-состояний)
+- [Стоп, тейк и трейлинг без гонки состояний](#стоп-тейк-и-трейлинг-без-гонки-состояний)
 - [Неторговые периоды](#неторговые-периоды)
+- [События BotTabSimple](#события-bottabsimple)
+- [Свойства Position](#свойства-position)
 - [Пошаговое руководство по добавлению стратегии](#пошаговое-руководство-по-добавлению-стратегии)
 - [Режимы работы (Regime)](#режимы-работы-regime)
 - [Требования](#требования)
-- [Видимость репозитория на GitHub](#видимость-репозитория-на-github)
 - [Автор](#автор)
 
 ---
@@ -32,10 +33,15 @@
 | Поддержка Inverse Futures | ✅ Готово |
 | Поддержка Bonds MOEX | ✅ Готово |
 | Стоп-лосс (CloseAtStop) | ✅ Готово |
+| Тейк-профит (CloseAtProfit) | ✅ Готово |
+| Трейлинг-стоп (CloseAtTrailingStop) | ✅ Заготовка |
 | Неторговые периоды (по времени и дням) | ✅ Готово |
 | Очистка словаря стопов при неудачном открытии | ✅ Готово |
+| Защита от двойного выставления стопа | ✅ Готово |
+| Защита от двойного ордера закрытия (`CloseActive`) | ✅ Готово |
+| Все события BotTabSimple (19 штук) | ✅ Подключены |
 | Синхронизация параметров GUI | ✅ Готово |
-| Логирование событий | ✅ Готово |
+| Подробный лог расчёта объёма | ✅ Готово |
 | **Торговая логика (сигналы входа/выхода)** | ❌ Ваша реализация |
 
 ---
@@ -44,13 +50,11 @@
 
 ### 1. Скопируйте файл в проект OsEngine
 
-Поместите `TemplateRobot.cs` в папку вашего проекта OsEngine:
-
 ```
 OsEngine/
 └── OsEngine/
     └── Robots/
-        └── TemplateRobot.cs   ← сюда
+        └── TemplateRobotAdvanced.cs   ← сюда
 ```
 
 ### 2. Переименуйте класс под свою стратегию
@@ -59,13 +63,13 @@ OsEngine/
 
 | Было | Станет |
 |---|---|
-| `TemplateRobot` | `MyStrategyRobot` |
-| `"TemplateRobot"` | `"MyStrategyRobot"` |
+| `TemplateRobotAdvanced` | `MyStrategyRobot` |
+| `"TemplateRobotAdvanced"` | `"MyStrategyRobot"` |
 
 ```csharp
 // Было:
-[Bot("TemplateRobot")]
-public class TemplateRobot : BotPanel
+[Bot("TemplateRobotAdvanced")]
+public class TemplateRobotAdvanced : BotPanel
 
 // Стало:
 [Bot("MyStrategyRobot")]
@@ -89,52 +93,89 @@ public class MyStrategyRobot : BotPanel
 ## Структура файла
 
 ```
-TemplateRobot.cs
+TemplateRobotAdvanced.cs
 │
 ├── КОНСТРУКТОР
 │   ├── Инициализация неторговых периодов
-│   ├── Регистрация параметров GUI
+│   ├── Регистрация параметров GUI (Base + Exit)
+│   ├── Подписка на все события BotTabSimple
 │   ├── TODO: создать параметры индикаторов
 │   └── TODO: создать и подключить индикаторы
 │
-├── ГЛАВНЫЙ ОБРАБОТЧИК СВЕЧИ  (_tab_CandleFinishedEvent)
+├── СОБЫТИЯ РЫНОЧНЫХ ДАННЫХ
+│   ├── _tab_CandleFinishedEvent     — закрытая свеча (главный поток)
+│   ├── _tab_CandleUpdateEvent       — обновление текущей свечи по тику
+│   ├── _tab_NewTickEvent            — каждый тик
+│   ├── _tab_BestBidAskChangeEvent   — лучший бид/аск
+│   ├── _tab_MarketDepthUpdateEvent  — стакан
+│   ├── _tab_ServerTimeChangeEvent   — время сервера
+│   ├── _tab_FirstTickToDayEvent     — первый тик нового дня
+│   └── _tab_PortfolioOnExchangeChangedEvent — изменение портфеля
+│
+├── СОБЫТИЯ ТЕХНИЧЕСКИЕ
+│   ├── _tab_SecuritySubscribeEvent  — подписка на инструмент
+│   ├── _tab_OrderUpdateEvent        — обновление ордера
+│   ├── _tab_CancelOrderFailEvent    — не удалось отменить ордер
+│   ├── _tab_MyTradeEvent            — своя сделка
+│   └── _tab_IndicatorUpdateEvent    — пересчёт индикатора
+│
+├── ГЛАВНЫЙ ОБРАБОТЧИК СВЕЧИ (_tab_CandleFinishedEvent)
 │   ├── Проверка режима (Regime)
 │   ├── Проверка неторгового времени
 │   ├── LogicClosePosition — логика закрытия
 │   └── LogicOpenPosition  — логика открытия
 │
-├── LogicOpenPosition         ← TODO: ваши сигналы входа
-├── LogicClosePosition        ← TODO: дополнительные условия выхода по сигналу
-├── SetStopLoss               — автоматически при открытии позиции (PositionOpeningSuccesEvent)
-├── OnOpeningFail             — очистка словаря стопов при неудаче ордера (PositionOpeningFailEvent)
+├── LogicOpenPosition    ← TODO: ваши сигналы входа
+├── LogicClosePosition   ← TODO: выход по сигналу + трейлинг + аварийный выход
+│
+├── СОБЫТИЯ ПОЗИЦИИ
+│   ├── OnPositionOpeningSucces      — выставить стоп + тейк
+│   ├── OnPositionOpeningFail        — очистить словарь
+│   ├── OnPositionClosingSucces      — логика после закрытия
+│   ├── OnPositionClosingFail        — повторная попытка закрыть
+│   ├── OnPositionStopActivate       — стоп сработал
+│   ├── OnPositionProfitActivate     — тейк сработал
+│   ├── OnPositionBuyAtStopActivate  — BuyAtStop активирован
+│   ├── OnPositionSellAtStopActivate — SellAtStop активирован
+│   └── OnPositionNetVolumeChange    — частичное исполнение
 │
 └── РАСЧЁТ ОБЪЁМА
     ├── CalcVolume(side, entryPrice, stopPrice)
-    ├── GetVolume(...)         — основная логика по всем секциям
-    └── GetAssetValue(...)     — баланс по конкретному активу
+    ├── GetVolume(...)     — основная логика по всем секциям
+    ├── LogVolume(...)     — подробный лог (Trade debug log = On)
+    └── GetAssetValue(...) — баланс по конкретному активу
 ```
 
 ---
 
 ## Параметры робота
 
-### Базовые параметры (вкладка "Base")
-
-Параметры регистрируются и отображаются в GUI в следующем порядке:
+### Вкладка "Base"
 
 | Параметр | Тип | По умолчанию | Описание |
 |---|---|---|---|
 | `Non trade periods` | button | — | Открыть диалог настройки неторговых периодов |
 | `Regime` | string | `Off` | Режим работы робота |
 | `Time zone UTC` | int | `4` | Часовой пояс для неторговых периодов |
+| `Trade debug log` | string | `Off` | Подробный лог расчёта объёма (`On` / `Off`) |
 | `Trade Section` | string | `SPOT и LinearPerpetual` | Тип торгуемого инструмента |
 | `Deposit Asset` | string | `USDT` | Валюта депозита для расчёта риска |
-| `Trade debug log` | string | `Off` | Подробный лог расчёта объёма (`On` / `Off`) |
 | `Volume Long (%)` | decimal | `2.5` | Риск на одну сделку лонг, % от депозита |
 | `Volume Short (%)` | decimal | `2.5` | Риск на одну сделку шорт, % от депозита |
+| `Min LOT (Tester)` | decimal | `0` | Минимальный объём в тестере/оптимизаторе (0 = не проверять) |
 | `Slippage (%)` | decimal | `0.1` | Проскальзывание, % от цены входа |
 | `Fee (%)` | decimal | `0.1` | Комиссия биржи, % (учитывается дважды: вход + выход) |
 | `Bond days to maturity` | int | `30` | Минимум дней до погашения облигации для входа |
+
+### Вкладка "Exit"
+
+| Параметр | Тип | По умолчанию | Описание |
+|---|---|---|---|
+| `Stop (%)` | decimal | `1.0` | Фиксированный стоп, % от цены входа |
+| `Profit (%, 0=off)` | decimal | `0` | Фиксированный тейк, % от цены входа (`0` = не использовать) |
+| `Use Trailing Stop` | bool | `false` | Включить трейлинг-стоп |
+
+> **Про фиксированный стоп/тейк:** используйте параметры вкладки Exit если вам нужен простой % от входа. Если стоп рассчитывается динамически (по индикатору, свингу, ATR) — передавайте цену напрямую в `CalcVolume()` и `CloseAtStop()`, параметры не нужны.
 
 ---
 
@@ -154,13 +195,22 @@ TemplateRobot.cs
 
 ```csharp
 decimal entry     = _tab.PriceBestAsk;
-decimal stopPrice = entry * 0.98m;  // стоп на 2% ниже
+decimal stopPrice = entry * (1m - _curStopPercent / 100m);  // фиксированный стоп
+// или:
+// decimal stopPrice = /* ваш уровень: индикатор, свинг, ATR */;
 
 decimal volume = CalcVolume(Side.Buy, entry, stopPrice);
 if (volume <= 0) return;  // риск-менеджер не пропускает сделку
 
-Position pos = _tab.BuyAtLimit(volume, entry);
-_stopByOrderId.TryAdd(pos.OpenOrders[0].NumberUser, stopPrice);
+decimal slippage = entry * (_curSlippagePercent / 100m);
+Position pos = _tab.BuyAtLimit(volume, entry + slippage);
+
+decimal profitPrice = _curProfitPercent > 0
+    ? entry * (1m + _curProfitPercent / 100m)
+    : 0m;
+
+_stopByOrderId.TryAdd(pos.OpenOrders[0].NumberUser,
+    new StopProfitPair { StopPrice = stopPrice, ProfitPrice = profitPrice });
 ```
 
 ### Поддерживаемые секции
@@ -175,66 +225,65 @@ _stopByOrderId.TryAdd(pos.OpenOrders[0].NumberUser, stopPrice);
 
 ---
 
-## Стоп-лосс на каждую позицию без гонки состояний
+## Стоп, тейк и трейлинг без гонки состояний
 
 ### Проблема
 
 OsEngine работает в двух потоках одновременно:
 
-- **Синхронный поток** — `CandleFinishedEvent`, где выставляется ордер на вход (`BuyAtLimit`)
-- **Асинхронный поток** — `PositionOpeningSuccesEvent`, который срабатывает позже, когда биржа подтвердила исполнение
+- **Синхронный поток** — `CandleFinishedEvent`, где выставляется ордер (`BuyAtLimit`)
+- **Асинхронный поток** — `PositionOpeningSuccesEvent`, когда биржа подтвердила исполнение
 
-Если хранить цену стопа в поле класса (`_stopPrice`), при нескольких одновременных позициях значение из одной сделки перезапишет значение другой — это и есть **гонка состояний (race condition)**. В результате стоп выставляется по неверной цене или не выставляется вовсе.
+Если хранить цену стопа в поле класса (`_stopPrice`), при нескольких одновременных позициях значение перезапишется — это **гонка состояний (race condition)**. Стоп выставляется по неверной цене или не выставляется вовсе.
 
-### Решение — `ConcurrentDictionary<int, decimal> _stopByOrderId`
+### Решение — `ConcurrentDictionary<int, StopProfitPair>`
 
-Шаблон использует `ConcurrentDictionary<int, decimal>`, где **ключ — `NumberUser` ордера на вход**, а значение — цена стопа, рассчитанная именно для этой заявки. `ConcurrentDictionary` обеспечивает потокобезопасность без явных `lock`-ов — это принципиальное отличие от обычного `Dictionary`.
+Шаблон хранит пару {стоп, тейк} в `ConcurrentDictionary`, где **ключ — `NumberUser` ордера на вход**. `ConcurrentDictionary` обеспечивает потокобезопасность без явных `lock`-ов.
 
 ```
 Синхронно (CandleFinishedEvent)          Асинхронно (PositionOpeningSuccesEvent)
 ─────────────────────────────────        ─────────────────────────────────────────
-1. Рассчитать stopPrice                  4. Биржа подтвердила исполнение
-2. BuyAtLimit → получить pos             5. SetStopLoss(pos) вызван движком
-3. Записать:                             6. Прочитать:
-   _stopByOrderId.TryAdd(                   _stopByOrderId.TryGetValue(
-     pos.OpenOrders[0].NumberUser,            pos.OpenOrders[0].NumberUser,
-     stopPrice)                               out decimal stopPrice)
-                                          7. Удалить ключ из словаря (TryRemove)
-                                          8. CloseAtStop(pos, stopPrice, ...)
+1. Рассчитать stopPrice, profitPrice     4. Биржа подтвердила исполнение
+2. BuyAtLimit → получить pos             5. OnPositionOpeningSucces(pos) вызван
+3. Записать в словарь:                   6. TryRemove(orderKey) — УДАЛЯЕТ ключ
+   _stopByOrderId.TryAdd(                7. CloseAtStop(pos, stopPrice, ...)
+     pos.OpenOrders[0].NumberUser,       8. CloseAtProfit(pos, profitPrice, ...)
+     new StopProfitPair { ... })
 ```
 
-`NumberUser` присваивается движком в момент создания ордера внутри `BuyAtLimit` — **до отправки на биржу**, поэтому он гарантированно доступен синхронно и уникален для каждой заявки.
+`NumberUser` присваивается движком **до отправки на биржу**, поэтому он гарантированно доступен синхронно и уникален для каждой заявки.
 
-### Почему это безопасно при нескольких позициях
+### Ключевое отличие от старого шаблона
 
-Каждая позиция хранит свой стоп под своим уникальным ключом. Удаление записи происходит в `SetStopLoss` сразу после чтения — стопы других позиций при этом не затрагиваются.
+В старом шаблоне (`TemplateRobotSL`) использовался `TryGetValue` (читает без удаления), а затем отдельно `TryRemove`. В новом шаблоне используется атомарный `TryRemove` — он **одновременно читает и удаляет**, что исключает двойное срабатывание.
 
 ```csharp
-// Синхронно — после выставления ордера
-Position pos = _tab.BuyAtLimit(volume, entry + slippage);
-_stopByOrderId.TryAdd(pos.OpenOrders[0].NumberUser, stopPrice);
-
-// Асинхронно — когда биржа подтвердила
-private void SetStopLoss(Position pos)
+// ✅ Новый шаблон: атомарный TryRemove
+if (!_stopByOrderId.TryRemove(orderKey, out StopProfitPair pair) || pair.StopPrice <= 0)
 {
-    int orderKey = pos.OpenOrders[0].NumberUser;
-
-    if (!_stopByOrderId.TryGetValue(orderKey, out decimal stopPrice) || stopPrice <= 0)
-    {
-        SendNewLogMessage($"[STOP] Стоп не найден для pos#{pos.Number}", LogMessageType.Error);
-        return;
-    }
-
-    _stopByOrderId.TryRemove(orderKey, out _);  // удаляем только этот ключ
-
-    decimal slippage = stopPrice * (_curSlippagePercent / 100m);
-    _tab.CloseAtStop(pos, stopPrice, stopPrice - slippage);  // для лонга
+    SendNewLogMessage($"[STOP] Стоп не найден для orderKey={orderKey}", LogMessageType.Error);
+    return;
 }
+// ключ уже удалён, повторный вызов ничего не найдёт
+_tab.CloseAtStop(pos, pair.StopPrice, pair.StopPrice - slippage);
+
+if (pair.ProfitPrice > 0)
+    _tab.CloseAtProfit(pos, pair.ProfitPrice, pair.ProfitPrice - profitSlippage);
 ```
 
-### Защита от двойного срабатывания
+### Защита от двойного ордера закрытия
 
-`SetStopLoss` проверяет `pos.StopOrderRedLine > 0` — если стоп уже выставлен (например, событие сработало дважды), повторная установка игнорируется:
+В `LogicClosePosition` перед любым `CloseAt*` всегда стоит проверка:
+
+```csharp
+if (pos.CloseActive) continue;  // уже есть активный ордер закрытия — пропускаем
+```
+
+Без этой проверки при быстром рынке можно послать второй `CloseAtMarket` пока первый ещё в полёте.
+
+### Защита от двойного выставления стопа
+
+`OnPositionOpeningSucces` проверяет `pos.StopOrderRedLine > 0` — если стоп уже выставлен (событие сработало дважды), повторная установка игнорируется:
 
 ```csharp
 if (pos.StopOrderRedLine > 0)
@@ -246,21 +295,35 @@ if (pos.StopOrderRedLine > 0)
 
 ### Очистка словаря при неудачном открытии
 
-Если ордер на открытие отклонён биржей или отменён до исполнения, `PositionOpeningSuccesEvent` не вызывается и `SetStopLoss` не срабатывает. Чтобы запись в словаре не осталась навсегда, предусмотрен обработчик `OnOpeningFail`:
+Если ордер на открытие отклонён биржей, `PositionOpeningSuccesEvent` не вызывается. Чтобы запись в словаре не осталась навсегда, предусмотрен `OnPositionOpeningFail`:
 
 ```csharp
-private void OnOpeningFail(Position pos)
+private void OnPositionOpeningFail(Position pos)
 {
     if (pos.OpenOrders == null || pos.OpenOrders.Count == 0) return;
-
     int orderKey = pos.OpenOrders[0].NumberUser;
-
     if (_stopByOrderId.TryRemove(orderKey, out _))
-    {
-        SendNewLogMessage(
-            $"[STOP] Стоп удалён из словаря (OpeningFail) orderKey={orderKey} pos#{pos.Number}",
-            LogMessageType.System);
-    }
+        SendNewLogMessage($"[STOP] Ключ удалён (OpeningFail) orderKey={orderKey}", LogMessageType.System);
+}
+```
+
+### Трейлинг-стоп
+
+Заготовка находится в `LogicClosePosition`. Включите параметр `Use Trailing Stop` и задайте уровень:
+
+```csharp
+// CloseAtTrailingStop двигает стоп только в прибыльную сторону.
+// Вызывайте каждый бар — движок сам решит, нужно ли обновлять.
+if (_curUseTrailingStop)
+{
+    decimal lastLow  = candles[candles.Count - 1].Low;
+    decimal lastHigh = candles[candles.Count - 1].High;
+    decimal slippage = candles[candles.Count - 1].Close * (_curSlippagePercent / 100m);
+
+    if (pos.Direction == Side.Buy)
+        _tab.CloseAtTrailingStop(pos, lastLow, lastLow - slippage);
+    else
+        _tab.CloseAtTrailingStop(pos, lastHigh, lastHigh + slippage);
 }
 ```
 
@@ -270,7 +333,7 @@ private void OnOpeningFail(Position pos)
 |---|---|---|---|
 | Поле класса `_stopPrice` | ❌ Есть | ❌ Стопы перемешиваются | — |
 | `Dictionary<int, decimal>` | ⚠️ Нужен `lock` | ✅ Каждая позиция — свой стоп | ❌ Без `OnOpeningFail` |
-| `ConcurrentDictionary` + `OnOpeningFail` | ✅ Нет | ✅ Каждая позиция — свой стоп | ✅ Нет |
+| `ConcurrentDictionary` + `TryRemove` + `OnOpeningFail` | ✅ Нет | ✅ Каждая позиция — свой стоп | ✅ Нет |
 
 ---
 
@@ -290,11 +353,110 @@ private void OnOpeningFail(Position pos)
 
 ---
 
+## События BotTabSimple
+
+Шаблон подключает все события `BotTabSimple`. Каждый обработчик задокументирован и готов к заполнению. Ненужные события удалите из конструктора, чтобы не тратить ресурсы.
+
+### События торговли
+
+| Событие | Метод | Когда вызывается |
+|---|---|---|
+| `CandleFinishedEvent` | `_tab_CandleFinishedEvent` | Закрытие свечи — основной торговый поток |
+| `CandleUpdateEvent` | `_tab_CandleUpdateEvent` | Тиковое обновление текущей свечи |
+| `PositionOpeningSuccesEvent` | `OnPositionOpeningSucces` | Позиция открыта (биржа подтвердила) |
+| `PositionOpeningFailEvent` | `OnPositionOpeningFail` | Ордер открытия отклонён |
+| `PositionClosingSuccesEvent` | `OnPositionClosingSucces` | Позиция закрыта |
+| `PositionClosingFailEvent` | `OnPositionClosingFail` | Ордер закрытия не прошёл |
+| `PositionStopActivateEvent` | `OnPositionStopActivate` | `CloseAtStop` сработал |
+| `PositionProfitActivateEvent` | `OnPositionProfitActivate` | `CloseAtProfit` сработал |
+| `PositionBuyAtStopActivateEvent` | `OnPositionBuyAtStopActivate` | `BuyAtStop` активирован |
+| `PositionSellAtStopActivateEvent` | `OnPositionSellAtStopActivate` | `SellAtStop` активирован |
+| `PositionNetVolumeChangeEvent` | `OnPositionNetVolumeChange` | Частичное исполнение ордера |
+
+### События рыночных данных
+
+| Событие | Метод | Когда вызывается |
+|---|---|---|
+| `NewTickEvent` | `_tab_NewTickEvent` | Каждый тик (высокая частота) |
+| `BestBidAskChangeEvent` | `_tab_BestBidAskChangeEvent` | Изменение лучшего бида/аска |
+| `MarketDepthUpdateEvent` | `_tab_MarketDepthUpdateEvent` | Обновление стакана |
+| `ServerTimeChangeEvent` | `_tab_ServerTimeChangeEvent` | Изменение серверного времени |
+| `FirstTickToDayEvent` | `_tab_FirstTickToDayEvent` | Первый тик нового дня |
+| `PortfolioOnExchangeChangedEvent` | `_tab_PortfolioOnExchangeChangedEvent` | Изменение портфеля |
+| `MyTradeEvent` | `_tab_MyTradeEvent` | Своя сделка исполнена |
+| `OrderUpdateEvent` | `_tab_OrderUpdateEvent` | Смена статуса ордера |
+| `CancelOrderFailEvent` | `_tab_CancelOrderFailEvent` | Не удалось отменить ордер |
+| `SecuritySubscribeEvent` | `_tab_SecuritySubscribeEvent` | Подписка на инструмент |
+| `IndicatorUpdateEvent` | `_tab_IndicatorUpdateEvent` | Пересчёт индикатора |
+
+---
+
+## Свойства Position
+
+В `LogicClosePosition` и обработчиках событий доступны все свойства открытой позиции:
+
+| Свойство | Тип | Описание |
+|---|---|---|
+| `pos.Number` | `int` | Уникальный номер позиции |
+| `pos.Direction` | `Side` | `Buy` / `Sell` |
+| `pos.State` | `PositionStateType` | Текущий статус (см. ниже) |
+| `pos.OpenVolume` | `decimal` | Текущий открытый объём → передавать в `CloseAt*` |
+| `pos.MaxVolume` | `decimal` | Максимальный объём при открытии |
+| `pos.EntryPrice` | `decimal` | Средняя цена входа по исполненным сделкам |
+| `pos.ClosePrice` | `decimal` | Средняя цена закрытия |
+| `pos.ProfitPortfolioPercent` | `decimal` | PnL в % от портфеля (с учётом комиссии) |
+| `pos.ProfitPortfolioAbs` | `decimal` | PnL в деньгах (с учётом комиссии и шага цены) |
+| `pos.ProfitOperationPercent` | `decimal` | PnL в % от цены входа (без комиссии) |
+| `pos.ProfitOperationAbs` | `decimal` | PnL в пунктах (без комиссии) |
+| `pos.StopOrderRedLine` | `decimal` | Уровень активации стопа (`> 0` если выставлен) |
+| `pos.ProfitOrderRedLine` | `decimal` | Уровень активации тейка (`> 0` если выставлен) |
+| `pos.StopOrderIsActive` | `bool` | Стоп активен |
+| `pos.ProfitOrderIsActive` | `bool` | Тейк активен |
+| `pos.CloseActive` | `bool` | Есть активный ордер на закрытие |
+| `pos.OpenActive` | `bool` | Есть активный ордер на открытие |
+| `pos.TimeOpen` | `DateTime` | Время открытия позиции |
+| `pos.TimeClose` | `DateTime` | Время закрытия |
+| `pos.Comment` | `string` | Произвольное поле для ваших данных |
+| `pos.SignalTypeOpen` | `string` | Метка сигнала открытия |
+| `pos.SignalTypeClose` | `string` | Метка сигнала закрытия |
+| `pos.OpenOrders` | `List<Order>` | Ордера на открытие |
+| `pos.CloseOrders` | `List<Order>` | Ордера на закрытие |
+| `pos.MyTrades` | `List<MyTrade>` | Все сделки по позиции |
+
+### Статусы позиции (`PositionStateType`)
+
+```
+None         — создана, ещё ничего не отправлено
+Opening      — ордер на открытие отправлен
+Open         — позиция открыта (биржа подтвердила)
+Closing      — ордер на закрытие отправлен
+Done         — позиция закрыта
+OpeningFail  — открывающий ордер отклонён
+ClosingFail  — закрывающий ордер не прошёл
+Deleted      — удалена
+```
+
+> ⚠️ В `LogicClosePosition` всегда проверяйте `pos.State == PositionStateType.Open` и `pos.CloseActive == false` — иначе попадёте на позиции в процессе закрытия.
+
+### Устаревшие свойства — не использовать
+
+| Устаревшее | Правильное |
+|---|---|
+| `ProfitPortfolioPersent` | `ProfitPortfolioPercent` |
+| `ProfitPortfolioPunkt` | `ProfitPortfolioAbs` |
+| `ProfitOperationPersent` | `ProfitPortfolioPercent` |
+| `StopOrderIsActiv` | `StopOrderIsActive` |
+| `ProfitOrderIsActiv` | `ProfitOrderIsActive` |
+| `CloseActiv` | `CloseActive` |
+| `OpenActiv` | `OpenActive` |
+
+---
+
 ## Пошаговое руководство по добавлению стратегии
 
 ### Шаг 1 — Добавить параметры индикатора
 
-В разделе **"// TODO: добавить параметры индикаторов здесь"** в блоке полей класса:
+В разделе `// TODO: добавить параметры индикаторов здесь`:
 
 ```csharp
 private readonly StrategyParameterInt _lengthEma;
@@ -345,73 +507,64 @@ _rsi.Reload();
 
 ### Шаг 4 — Реализовать сигнал входа
 
-В методе `LogicOpenPosition()`:
+В `LogicOpenPosition()` раскомментируйте и адаптируйте заготовку. Пример для лонга:
 
 ```csharp
-private void LogicOpenPosition(List<Candle> candles)
+decimal emaValue = _ema.DataSeries[0].Last;
+decimal rsiValue = _rsi.DataSeries[0].Last;
+if (emaValue <= 0 || rsiValue <= 0) return;
+
+if (lastPrice > emaValue && rsiValue < 70)
 {
-    decimal lastPrice = candles[candles.Count - 1].Close;
+    decimal entry     = _tab.PriceBestAsk;
+    if (entry <= 0) entry = lastPrice;
 
-    decimal emaValue = _ema.DataSeries[0].Last;
-    decimal rsiValue = _rsi.DataSeries[0].Last;
+    decimal stopPrice = emaValue * 0.99m;  // стоп под EMA
 
-    if (emaValue <= 0 || rsiValue <= 0) return;
+    decimal volume = CalcVolume(Side.Buy, entry, stopPrice);
+    if (volume <= 0) return;
 
-    // Вход в лонг: цена выше EMA и RSI не перекуплен
-    if (_regime.ValueString == "On" || _regime.ValueString == "LONG-POS")
+    decimal slippage = entry * (_curSlippagePercent / 100m);
+    Position pos = _tab.BuyAtLimit(volume, entry + slippage, "EMA+RSI");
+
+    if (pos == null || pos.OpenOrders == null || pos.OpenOrders.Count == 0)
     {
-        if (lastPrice > emaValue && rsiValue < 70)
-        {
-            decimal entry = _tab.PriceBestAsk;
-            if (entry <= 0) entry = lastPrice;
-
-            decimal stopPrice = emaValue * 0.99m;  // стоп под EMA
-
-            decimal volume = CalcVolume(Side.Buy, entry, stopPrice);
-            if (volume <= 0) return;
-
-            decimal slippage = entry * (_curSlippagePercent / 100m);
-            Position pos = _tab.BuyAtLimit(volume, entry + slippage);
-
-            if (pos == null || pos.OpenOrders == null || pos.OpenOrders.Count == 0)
-            {
-                SendNewLogMessage("[OPEN] BUY — позиция не создана", LogMessageType.Error);
-                return;
-            }
-
-            _stopByOrderId.TryAdd(pos.OpenOrders[0].NumberUser, stopPrice);
-            SendNewLogMessage($"[OPEN] BUY | entry≈{entry:F4} stop={stopPrice:F4} vol={volume}", LogMessageType.System);
-        }
+        SendNewLogMessage("[OPEN] BUY — позиция не создана", LogMessageType.Error);
+        return;
     }
+
+    decimal profitPrice = _curProfitPercent > 0
+        ? entry * (1m + _curProfitPercent / 100m)
+        : 0m;
+
+    _stopByOrderId.TryAdd(pos.OpenOrders[0].NumberUser,
+        new StopProfitPair { StopPrice = stopPrice, ProfitPrice = profitPrice });
+
+    SendNewLogMessage(
+        $"[OPEN] BUY | entry≈{entry:F4} stop={stopPrice:F4} profit={profitPrice:F4} vol={volume}",
+        LogMessageType.System);
 }
 ```
 
-### Шаг 5 — Добавить дополнительные условия выхода (опционально)
+### Шаг 5 — Добавить условия выхода по сигналу (опционально)
 
-Начальный стоп-лосс уже выставляется автоматически через `SetStopLoss`. В `LogicClosePosition` можно добавить выход по сигналу индикатора — например, закрыть позицию при развороте:
+Начальный стоп и тейк выставляются автоматически. В `LogicClosePosition` добавьте выход по индикатору:
 
 ```csharp
-private void LogicClosePosition(List<Candle> candles)
+decimal emaValue = _ema.DataSeries[0].Last;
+decimal lastPrice = candles[candles.Count - 1].Close;
+
+for (int i = 0; openPositions != null && i < openPositions.Count; i++)
 {
-    List<Position> openPositions = _tab.PositionsOpenAll;
+    Position pos = openPositions[i];
+    if (pos.State != PositionStateType.Open) continue;
+    if (pos.CloseActive) continue;
 
-    decimal emaValue = _ema.DataSeries[0].Last;
+    if (pos.Direction == Side.Buy && lastPrice < emaValue)
+        _tab.CloseAtMarket(pos, pos.OpenVolume, "EmaClose");
 
-    for (int i = 0; openPositions != null && i < openPositions.Count; i++)
-    {
-        Position pos = openPositions[i];
-        if (pos.State != PositionStateType.Open) continue;
-
-        decimal lastPrice = candles[candles.Count - 1].Close;
-
-        // Выход из лонга при закрытии цены ниже EMA
-        if (pos.Direction == Side.Buy && lastPrice < emaValue)
-            _tab.CloseAtMarket(pos, pos.OpenVolume);
-
-        // Выход из шорта при закрытии цены выше EMA
-        if (pos.Direction == Side.Sell && lastPrice > emaValue)
-            _tab.CloseAtMarket(pos, pos.OpenVolume);
-    }
+    if (pos.Direction == Side.Sell && lastPrice > emaValue)
+        _tab.CloseAtMarket(pos, pos.OpenVolume, "EmaClose");
 }
 ```
 
@@ -422,10 +575,12 @@ private void LogicClosePosition(List<Candle> candles)
 | Значение | Поведение |
 |---|---|
 | `Off` | Робот полностью остановлен |
-| `On` | Разрешены лонг и шорт (торговая логика определяется в `LogicOpenPosition`) |
-| `LONG-POS` | Только лонг |
-| `SHORT-POS` | Только шорт |
+| `On` | Разрешены лонг и шорт |
+| `LONG-POS` | Только лонг (`SHORT-POS` пропускается) |
+| `SHORT-POS` | Только шорт (`LONG-POS` пропускается) |
 | `CLOSE-POS` | Только закрывает существующие позиции, новых не открывает |
+
+> В шаблоне режимы реализованы через `!= "SHORT-POS"` и `!= "LONG-POS"`, что означает: режим `On` открывает оба направления, `LONG-POS` блокирует блок шорта, `SHORT-POS` блокирует блок лонга.
 
 ---
 
@@ -452,4 +607,4 @@ private void LogicClosePosition(List<Candle> candles)
 
 ---
 
-`osengine` `trading-bot` `algorithmic-trading` `csharp` `dotnet` `template` `quant` `robot` `strategy` `stop-loss` `risk-management` `moex` `futures` `spot` `bybit` `binance` `trading-robot` `boilerplate` `osengine-robot` `osengine-template`
+`osengine` `trading-bot` `algorithmic-trading` `csharp` `dotnet` `template` `quant` `robot` `strategy` `stop-loss` `take-profit` `trailing-stop` `risk-management` `moex` `futures` `spot` `bybit` `binance` `trading-robot` `boilerplate` `osengine-robot` `osengine-template`
