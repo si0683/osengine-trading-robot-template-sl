@@ -32,15 +32,16 @@ slippage and commission. Supports SPOT / LinearPerpetual, Stocks MOEX, InversFut
 
 namespace OsEngine.Robots
 {
-    [Bot("TemplateRobotSL")]
-    public class TemplateRobotSL : BotPanel
+    [Bot("TemplateRobotAdvanced")]
+    public class TemplateRobotAdvanced : BotPanel
     {
         // ── Вкладка ──────────────────────────────────────────────────────────────────
         private readonly BotTabSimple _tab;
 
         // ── Базовые параметры ────────────────────────────────────────────────────────
         private readonly StrategyParameterString _regime;
-        private StrategyParameterString _tradeLogOnOff;
+        private readonly StrategyParameterString _tradeLogOnOff;
+
         // ── Параметры объёма ─────────────────────────────────────────────────────────
         private readonly StrategyParameterString _modeTrade;
         private readonly StrategyParameterString _assetNameCurrent;
@@ -51,6 +52,16 @@ namespace OsEngine.Robots
         private readonly StrategyParameterDecimal _feePercent;
         private readonly StrategyParameterInt _bondDaysToMaturity;
         private readonly StrategyParameterButton _tradePeriodsShowDialogButton;
+
+        // ── Параметры стопа и тейка ──────────────────────────────────────────────────
+        //
+        //   Используются только если вы хотите фиксированный % стоп/тейк.
+        //   Если стоп рассчитывается динамически (по индикатору / свингу) —
+        //   передавайте цену напрямую в CalcVolume() и CloseAtStop().
+        //
+        private readonly StrategyParameterDecimal _stopPercent;    // % от цены входа
+        private readonly StrategyParameterDecimal _profitPercent;  // % от цены входа (0 = не использовать)
+        private readonly StrategyParameterBool _useTrailingStop;   // двигать стоп в б/у и далее
 
         // ── Параметры неторгового времени ────────────────────────────────────────────
         private readonly StrategyParameterInt _timeZoneUtc;
@@ -72,24 +83,36 @@ namespace OsEngine.Robots
         private decimal _curFeePercent;
         private int _curBondDaysToMaturity;
         private int _curTimeZoneUtc;
+        private decimal _curStopPercent;
+        private decimal _curProfitPercent;
+        private bool _curUseTrailingStop;
 
         // ── Словарь стопов ───────────────────────────────────────────────────────────
         //
-        //   Ключ     = order.NumberUser — уникальный int, присваивается движком при создании
-        //              ордера ВНУТРИ BuyAtLimit/SellAtLimit, до отправки на биржу.
+        //   Ключ     = order.NumberUser — уникальный int, присваивается движком при
+        //              создании ордера внутри BuyAtLimit/SellAtLimit, до отправки на биржу.
         //   Значение = начальная цена стопа, рассчитанная для этой конкретной заявки.
         //
         //   Запись добавляется сразу после BuyAtLimit (синхронно, поток свечей).
-        //   Запись удаляется в SetStopLoss после выставления начального стопа (асинхронно,
-        //   поток событий биржи). ConcurrentDictionary обеспечивает потокобезопасность
-        //   без явных lock-ов.
-        private readonly ConcurrentDictionary<int, decimal> _stopByOrderId = new ConcurrentDictionary<int, decimal>();
+        //   Запись удаляется в SetStopAndProfit (асинхронно, поток событий биржи),
+        //   либо в OnOpeningFail (ордер отклонён биржей).
+        //   ConcurrentDictionary обеспечивает потокобезопасность без явных lock-ов.
+        //
+        private readonly ConcurrentDictionary<int, StopProfitPair> _stopByOrderId
+            = new ConcurrentDictionary<int, StopProfitPair>();
+
+        // Пара стоп + тейк для одного ордера
+        private struct StopProfitPair
+        {
+            public decimal StopPrice;
+            public decimal ProfitPrice; // 0 = не использовать
+        }
 
         // ════════════════════════════════════════════════════════════════════════════
         //   КОНСТРУКТОР
         // ════════════════════════════════════════════════════════════════════════════
 
-        public TemplateRobotSL(string name, StartProgram startProgram) : base(name, startProgram)
+        public TemplateRobotAdvanced(string name, StartProgram startProgram) : base(name, startProgram)
         {
             _tradePeriods = new NonTradePeriods(name);
             _tradePeriods.NonTradePeriodGeneral.NonTradePeriod1Start = new TimeOfDay { Hour = 0, Minute = 0 };
@@ -108,27 +131,39 @@ namespace OsEngine.Robots
             TabCreate(BotTabType.Simple);
             _tab = TabsSimple[0];
 
+            // ── Кнопка настройки неторговых периодов ─────────────────────────────────
             _tradePeriodsShowDialogButton = CreateParameterButton("Non trade periods", "Base");
             _tradePeriodsShowDialogButton.UserClickOnButtonEvent += () => _tradePeriods.ShowDialog();
 
-            // Базовые настройки
+            // ── Режим и лог ──────────────────────────────────────────────────────────
             _regime = CreateParameter("Regime", "Off",
                 new[] { "Off", "On", "LONG-POS", "SHORT-POS", "CLOSE-POS" }, "Base");
             _timeZoneUtc = CreateParameter("Time zone UTC", 4, -24, 24, 1, "Base");
-
-            // Настройки объёма
-            _modeTrade = CreateParameter("Trade Section",
-             "SPOT и LinearPerpetual",
-             new[] { "SPOT и LinearPerpetual", "InversFutures", "Stocks MOEX", "Futures MOEX", "Bonds MOEX" }, "Base");
-            _assetNameCurrent = CreateParameter("Deposit Asset", "USDT",
-            new[] { "USDT", "USDC", "USD", "RUB", "EUR", "BTC", "ETH", "XRP", "LTC", "SOL", "Prime" }, "Base");
             _tradeLogOnOff = CreateParameter("Trade debug log", "Off", new[] { "On", "Off" }, "Base");
+
+            // ── Объём ────────────────────────────────────────────────────────────────
+            _modeTrade = CreateParameter("Trade Section",
+                "SPOT и LinearPerpetual",
+                new[] { "SPOT и LinearPerpetual", "InversFutures", "Stocks MOEX", "Futures MOEX", "Bonds MOEX" }, "Base");
+            _assetNameCurrent = CreateParameter("Deposit Asset", "USDT",
+                new[] { "USDT", "USDC", "USD", "RUB", "EUR", "BTC", "ETH", "XRP", "LTC", "SOL", "Prime" }, "Base");
             _volumeLong = CreateParameter("Volume Long (%)", 2.5m, 0.1m, 50m, 0.1m, "Base");
             _volumeShort = CreateParameter("Volume Short (%)", 2.5m, 0.1m, 50m, 0.1m, "Base");
             _minVolumeTester = CreateParameter("Min LOT (Tester)", 0m, 0m, 1000m, 0.01m, "Base");
             _slippagePercent = CreateParameter("Slippage (%)", 0.1m, 0.01m, 2m, 0.01m, "Base");
             _feePercent = CreateParameter("Fee (%)", 0.1m, 0.01m, 1m, 0.01m, "Base");
             _bondDaysToMaturity = CreateParameter("Bond days to maturity", 30, 1, 365, 1, "Base");
+
+            // ── Стоп / Тейк ──────────────────────────────────────────────────────────
+            //
+            //   Если вы хотите динамический стоп (от индикатора / свинга) — задавайте
+            //   цену прямо в LogicOpenPosition и не используйте эти параметры.
+            //   Если хотите фиксированный % — используйте параметры ниже.
+            //
+            _stopPercent = CreateParameter("Stop (%)", 1.0m, 0.1m, 20m, 0.1m, "Exit");
+            _profitPercent = CreateParameter("Profit (%, 0=off)", 0m, 0m, 100m, 0.5m, "Exit");
+            _useTrailingStop = CreateParameter("Use Trailing Stop", false, "Exit");
+
             // TODO: создать параметры индикаторов здесь
             // _lengthMyIndicator = CreateParameter("Length", 20, 5, 200, 5, "Indicator");
 
@@ -138,11 +173,44 @@ namespace OsEngine.Robots
             // ((IndicatorParameterInt)_myIndicator.Parameters[0]).ValueInt = _lengthMyIndicator.ValueInt;
             // _myIndicator.Save();
 
-            // Подписки
+            // ── Подписки на события BotTabSimple ─────────────────────────────────────
             ParametrsChangeByUser += OnParametrsChangeByUser;
-            _tab.CandleFinishedEvent += _tab_CandleFinishedEvent;
-            _tab.PositionOpeningSuccesEvent += SetStopLoss;    // асинхронно, после подтверждения биржи
-            _tab.PositionOpeningFailEvent += OnOpeningFail;  // очищаем стоп если ордер не прошёл
+
+            // Основной поток торговли
+            _tab.CandleFinishedEvent += _tab_CandleFinishedEvent;       // закрытая свеча
+            _tab.CandleUpdateEvent += _tab_CandleUpdateEvent;           // тиковое обновление текущей свечи (опционально)
+
+            // Результаты ордеров открытия
+            _tab.PositionOpeningSuccesEvent += OnPositionOpeningSucces;  // открыта: выставить стоп/тейк
+            _tab.PositionOpeningFailEvent += OnPositionOpeningFail;      // отклонена: очистить словарь
+
+            // Результаты ордеров закрытия
+            _tab.PositionClosingSuccesEvent += OnPositionClosingSucces;  // позиция закрыта
+            _tab.PositionClosingFailEvent += OnPositionClosingFail;      // ордер закрытия не прошёл
+
+            // Срабатывание стоп-заявок
+            _tab.PositionStopActivateEvent += OnPositionStopActivate;           // CloseAtStop активирован
+            _tab.PositionProfitActivateEvent += OnPositionProfitActivate;       // CloseAtProfit активирован
+            _tab.PositionBuyAtStopActivateEvent += OnPositionBuyAtStopActivate; // BuyAtStop активирован
+            _tab.PositionSellAtStopActivateEvent += OnPositionSellAtStopActivate; // SellAtStop активирован
+
+            // Изменение объёма позиции (частичные сделки)
+            _tab.PositionNetVolumeChangeEvent += OnPositionNetVolumeChange;
+
+            // Рыночные данные
+            _tab.NewTickEvent += _tab_NewTickEvent;                       // тик (осторожно: высокая частота)
+            _tab.BestBidAskChangeEvent += _tab_BestBidAskChangeEvent;     // лучший бид/аск
+            _tab.MarketDepthUpdateEvent += _tab_MarketDepthUpdateEvent;   // стакан
+            _tab.ServerTimeChangeEvent += _tab_ServerTimeChangeEvent;     // время сервера
+            _tab.FirstTickToDayEvent += _tab_FirstTickToDayEvent;         // первый тик нового дня
+            _tab.PortfolioOnExchangeChangedEvent += _tab_PortfolioOnExchangeChangedEvent; // изменение портфеля
+
+            // Технические события
+            _tab.SecuritySubscribeEvent += _tab_SecuritySubscribeEvent;   // подписка на инструмент
+            _tab.MyTradeEvent += _tab_MyTradeEvent;                       // своя сделка
+            _tab.OrderUpdateEvent += _tab_OrderUpdateEvent;               // обновление ордера
+            _tab.CancelOrderFailEvent += _tab_CancelOrderFailEvent;       // не удалось отменить ордер
+            _tab.IndicatorUpdateEvent += _tab_IndicatorUpdateEvent;       // обновление индикатора
 
             SyncParams();
 
@@ -154,7 +222,7 @@ namespace OsEngine.Robots
         //   ОБЯЗАТЕЛЬНЫЕ ПЕРЕГРУЗКИ
         // ════════════════════════════════════════════════════════════════════════════
 
-        public override string GetNameStrategyType() => "TemplateRobotSL";
+        public override string GetNameStrategyType() => "TemplateRobotAdvanced";
 
         public override void ShowIndividualSettingsDialog() { }
 
@@ -172,12 +240,6 @@ namespace OsEngine.Robots
             SyncParams();
         }
 
-        private DateTime LocalTime(DateTime utcTime)
-        {
-            if (utcTime == DateTime.MinValue) return utcTime;
-            return utcTime.AddHours(_curTimeZoneUtc);
-        }
-
         private void SyncParams()
         {
             _curVolumeLong = _volumeLong.ValueDecimal;
@@ -187,6 +249,121 @@ namespace OsEngine.Robots
             _curFeePercent = _feePercent.ValueDecimal;
             _curTimeZoneUtc = _timeZoneUtc.ValueInt;
             _curBondDaysToMaturity = _bondDaysToMaturity.ValueInt;
+            _curStopPercent = _stopPercent.ValueDecimal;
+            _curProfitPercent = _profitPercent.ValueDecimal;
+            _curUseTrailingStop = _useTrailingStop.ValueBool;
+        }
+
+        private DateTime LocalTime(DateTime utcTime)
+        {
+            if (utcTime == DateTime.MinValue) return utcTime;
+            return utcTime.AddHours(_curTimeZoneUtc);
+        }
+
+        // ════════════════════════════════════════════════════════════════════════════
+        //   СОБЫТИЯ РЫНОЧНЫХ ДАННЫХ
+        //
+        //   Большинство этих обработчиков намеренно оставлены пустыми — они нужны
+        //   только если стратегия требует реакции на соответствующие события.
+        //   Удалите ненужные подписки из конструктора, чтобы не тратить ресурсы.
+        // ════════════════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Обновление текущей (незакрытой) свечи по тику.
+        /// Используйте, если стратегия должна реагировать внутри бара.
+        /// Осторожно: вызывается очень часто. Тяжёлые вычисления делать здесь не стоит.
+        /// </summary>
+        private void _tab_CandleUpdateEvent(List<Candle> candles)
+        {
+            // TODO: логика на незакрытой свече (например, трейлинг стоп по цене)
+        }
+
+        /// <summary>
+        /// Каждый тик (сделка на бирже). Высокая частота — используйте осторожно.
+        /// </summary>
+        private void _tab_NewTickEvent(Trade tick)
+        {
+            // TODO: логика по тикам
+        }
+
+        /// <summary>
+        /// Изменение лучшего бида и аска.
+        /// </summary>
+        private void _tab_BestBidAskChangeEvent(decimal bestBid, decimal bestAsk)
+        {
+            // TODO: логика по изменению спреда
+        }
+
+        /// <summary>
+        /// Обновление стакана заявок.
+        /// </summary>
+        private void _tab_MarketDepthUpdateEvent(MarketDepth marketDepth)
+        {
+            // TODO: логика по стакану
+        }
+
+        /// <summary>
+        /// Изменение серверного времени.
+        /// </summary>
+        private void _tab_ServerTimeChangeEvent(DateTime serverTime)
+        {
+            // TODO: логика по времени (например, закрытие позиции в конце дня)
+        }
+
+        /// <summary>
+        /// Первый тик нового торгового дня. Удобно для сброса дневных счётчиков.
+        /// </summary>
+        private void _tab_FirstTickToDayEvent(Trade firstTick)
+        {
+            // TODO: сброс дневных переменных / логика начала дня
+        }
+
+        /// <summary>
+        /// Изменение портфеля на бирже (баланс, маржа и т.д.).
+        /// </summary>
+        private void _tab_PortfolioOnExchangeChangedEvent(Portfolio portfolio)
+        {
+            // TODO: логика при изменении портфеля
+        }
+
+        /// <summary>
+        /// Подписка на инструмент подтверждена.
+        /// </summary>
+        private void _tab_SecuritySubscribeEvent(Security security)
+        {
+            // TODO: логика при подписке на инструмент
+        }
+
+        /// <summary>
+        /// Обновление ордера (Placed, Active, Done, Cancel...).
+        /// </summary>
+        private void _tab_OrderUpdateEvent(Order order)
+        {
+            // TODO: дополнительная реакция на смену статуса ордера
+        }
+
+        /// <summary>
+        /// Не удалось отменить ордер (биржа отказала).
+        /// </summary>
+        private void _tab_CancelOrderFailEvent(Order order)
+        {
+            SendNewLogMessage($"[ORDER] Не удалось отменить ордер #{order.NumberUser}", LogMessageType.Error);
+        }
+
+        /// <summary>
+        /// Наша сделка прошла (частичное или полное исполнение ордера).
+        /// </summary>
+        private void _tab_MyTradeEvent(MyTrade myTrade)
+        {
+            // TODO: логика при исполнении нашей сделки
+        }
+
+        /// <summary>
+        /// Индикатор пересчитан (если нужна реакция на обновление индикатора).
+        /// </summary>
+        private void _tab_IndicatorUpdateEvent()
+        {
+            // TODO: логика при обновлении индикаторов
         }
 
         // ════════════════════════════════════════════════════════════════════════════
@@ -233,9 +410,9 @@ namespace OsEngine.Robots
         //
         //   Шаблон показывает правильный порядок действий:
         //   1. Получить сигнальные значения индикаторов
-        //   2. Определить цену стопа
+        //   2. Определить цену стопа (фиксированный % или динамически от индикатора)
         //   3. Рассчитать объём через CalcVolume(side, entry, stopPrice)
-        //   4. Отправить ордер и сохранить стоп в словарь _stopByOrderId
+        //   4. Отправить ордер и сохранить {стоп, тейк} в словарь _stopByOrderId
         // ════════════════════════════════════════════════════════════════════════════
 
         private void LogicOpenPosition(List<Candle> candles)
@@ -246,7 +423,7 @@ namespace OsEngine.Robots
             // decimal signalValue = _myIndicator.DataSeries[0].Last;
 
             // ── LONG ─────────────────────────────────────────────────────────────────
-            if (_regime.ValueString == "LONG-POS")
+            if (_regime.ValueString != "SHORT-POS")
             {
                 // TODO: условие входа в лонг
                 // if (lastPrice > signalValue)
@@ -254,7 +431,12 @@ namespace OsEngine.Robots
                 //     decimal entry = _tab.PriceBestAsk;
                 //     if (entry <= 0) entry = lastPrice;
                 //
-                //     decimal stopPrice = /* TODO: ваш уровень стопа */;
+                //     // Вариант 1: фиксированный % стоп из параметров
+                //     decimal stopPrice = entry * (1m - _curStopPercent / 100m);
+                //
+                //     // Вариант 2: динамический стоп от индикатора / свинга:
+                //     // decimal stopPrice = /* ваш уровень */;
+                //
                 //     if (stopPrice <= 0 || stopPrice >= entry) return;
                 //
                 //     decimal volume = CalcVolume(Side.Buy, entry, stopPrice);
@@ -262,6 +444,8 @@ namespace OsEngine.Robots
                 //
                 //     decimal slippage = entry * (_curSlippagePercent / 100m);
                 //     Position pos = _tab.BuyAtLimit(volume, entry + slippage);
+                //     // или:  _tab.BuyAtMarket(volume);
+                //     // или:  _tab.BuyAtStop(volume, entry+slippage, entry, StopActivateType.HigherOrEqual, 3);
                 //
                 //     if (pos == null || pos.OpenOrders == null || pos.OpenOrders.Count == 0)
                 //     {
@@ -269,16 +453,22 @@ namespace OsEngine.Robots
                 //         return;
                 //     }
                 //
-                //     _stopByOrderId.TryAdd(pos.OpenOrders[0].NumberUser, stopPrice);
+                //     // Тейк: 0 = не выставлять
+                //     decimal profitPrice = _curProfitPercent > 0
+                //         ? entry * (1m + _curProfitPercent / 100m)
+                //         : 0m;
+                //
+                //     _stopByOrderId.TryAdd(pos.OpenOrders[0].NumberUser,
+                //         new StopProfitPair { StopPrice = stopPrice, ProfitPrice = profitPrice });
                 //
                 //     SendNewLogMessage(
-                //         $"[OPEN] BUY | entry≈{entry:F4} stop={stopPrice:F4} vol={volume}",
+                //         $"[OPEN] BUY | entry≈{entry:F4} stop={stopPrice:F4} profit={profitPrice:F4} vol={volume}",
                 //         LogMessageType.System);
                 // }
             }
 
             // ── SHORT ────────────────────────────────────────────────────────────────
-            if (_regime.ValueString == "SHORT-POS")
+            if (_regime.ValueString != "LONG-POS")
             {
                 // TODO: условие входа в шорт
                 // if (lastPrice < signalValue)
@@ -286,7 +476,7 @@ namespace OsEngine.Robots
                 //     decimal entry = _tab.PriceBestBid;
                 //     if (entry <= 0) entry = lastPrice;
                 //
-                //     decimal stopPrice = /* TODO: ваш уровень стопа */;
+                //     decimal stopPrice = entry * (1m + _curStopPercent / 100m);
                 //     if (stopPrice <= 0 || stopPrice <= entry) return;
                 //
                 //     decimal volume = CalcVolume(Side.Sell, entry, stopPrice);
@@ -301,10 +491,15 @@ namespace OsEngine.Robots
                 //         return;
                 //     }
                 //
-                //     _stopByOrderId.TryAdd(pos.OpenOrders[0].NumberUser, stopPrice);
+                //     decimal profitPrice = _curProfitPercent > 0
+                //         ? entry * (1m - _curProfitPercent / 100m)
+                //         : 0m;
+                //
+                //     _stopByOrderId.TryAdd(pos.OpenOrders[0].NumberUser,
+                //         new StopProfitPair { StopPrice = stopPrice, ProfitPrice = profitPrice });
                 //
                 //     SendNewLogMessage(
-                //         $"[OPEN] SELL | entry≈{entry:F4} stop={stopPrice:F4} vol={volume}",
+                //         $"[OPEN] SELL | entry≈{entry:F4} stop={stopPrice:F4} profit={profitPrice:F4} vol={volume}",
                 //         LogMessageType.System);
                 // }
             }
@@ -313,9 +508,9 @@ namespace OsEngine.Robots
         // ════════════════════════════════════════════════════════════════════════════
         //   ЛОГИКА ЗАКРЫТИЯ — TODO: реализовать
         //
-        //   Начальный стоп выставляется автоматически в SetStopLoss при открытии.
-        //   Здесь можно добавить дополнительные условия выхода по сигналу индикатора:
-        //   например, CloseAtMarket или CloseAtLimit при появлении сигнала разворота.
+        //   Начальный стоп и тейк выставляются автоматически в OnPositionOpeningSucces.
+        //   Здесь — дополнительные условия выхода по сигналу индикатора,
+        //   а также обновление трейлинг-стопа каждый бар.
         // ════════════════════════════════════════════════════════════════════════════
 
         private void LogicClosePosition(List<Candle> candles)
@@ -325,28 +520,86 @@ namespace OsEngine.Robots
             for (int i = 0; openPositions != null && i < openPositions.Count; i++)
             {
                 Position pos = openPositions[i];
+
+                // Пропускаем все кроме полностью открытых
                 if (pos.State != PositionStateType.Open) continue;
 
+                // Пропускаем если уже висит активный ордер на закрытие
+                if (pos.CloseActive) continue;
+
+                // ── Справочник: свойства Position, полезные для логики выхода ───────
+                //
+                //   pos.OpenVolume               — текущий открытый объём → передавать в CloseAt*
+                //   pos.MaxVolume                — объём при открытии
+                //   pos.EntryPrice               — средняя цена входа (по сделкам)
+                //   pos.Direction                — Side.Buy / Side.Sell
+                //   pos.ProfitPortfolioPercent   — PnL в % от портфеля (с комиссией)  ← правильное имя
+                //   pos.ProfitPortfolioAbs       — PnL в деньгах (с комиссией и шагом цены)
+                //   pos.ProfitOperationPercent   — PnL в % от цены входа (без комиссии)
+                //   pos.ProfitOperationAbs       — PnL в пунктах (без комиссии)
+                //   pos.StopOrderRedLine         — текущий уровень стопа (> 0 если выставлен)
+                //   pos.ProfitOrderRedLine       — текущий уровень тейка (> 0 если выставлен)
+                //   pos.StopOrderIsActive        — стоп активен
+                //   pos.ProfitOrderIsActive      — тейк активен
+                //   pos.TimeOpen                 — время открытия позиции
+                //   pos.Comment                  — произвольное поле для ваших данных
+                //   pos.SignalTypeOpen           — метка сигнала открытия
+                //   pos.Number                   — уникальный номер позиции
+
+                // ── Трейлинг стоп ───────────────────────────────────────────────────
+                //
+                //   CloseAtTrailingStop двигает стоп только в прибыльную сторону.
+                //   Вызывайте каждый бар — движок сам решит, нужно ли обновлять.
+                //
+                if (_curUseTrailingStop)
+                {
+                    // TODO: задать уровень трейлинга (пример: по Low/High последней свечи)
+                    // decimal lastLow  = candles[candles.Count - 1].Low;
+                    // decimal lastHigh = candles[candles.Count - 1].High;
+                    // decimal slippage = candles[candles.Count - 1].Close * (_curSlippagePercent / 100m);
+                    //
+                    // if (pos.Direction == Side.Buy)
+                    //     _tab.CloseAtTrailingStop(pos, lastLow, lastLow - slippage);
+                    // else
+                    //     _tab.CloseAtTrailingStop(pos, lastHigh, lastHigh + slippage);
+                }
+
+                // ── Выход по сигналу индикатора ─────────────────────────────────────
+                //
                 // TODO: добавить условия выхода по сигналу
-                // Например:
-                // if (pos.Direction == Side.Buy && /* сигнал разворота */ )
-                //     _tab.CloseAtMarket(pos, pos.OpenVolume);
+                //
+                // decimal signalValue = _myIndicator.DataSeries[0].Last;
+                // decimal slippage    = pos.EntryPrice * (_curSlippagePercent / 100m);
+                //
+                // if (pos.Direction == Side.Buy && /* сигнал разворота */)
+                //     _tab.CloseAtMarket(pos, pos.OpenVolume, "SignalClose");
+                //
+                // if (pos.Direction == Side.Sell && /* сигнал разворота */)
+                //     _tab.CloseAtMarket(pos, pos.OpenVolume, "SignalClose");
+
+                // ── Аварийный выход по просадке (опционально) ──────────────────────
+                //
+                // Пример: выход если просадка позиции превышает 1.5× стоп-параметр
+                // if (pos.ProfitPortfolioPercent < -(_curStopPercent * 1.5m))
+                // {
+                //     SendNewLogMessage(
+                //         $"[EMERGENCY] pos#{pos.Number} PnL={pos.ProfitPortfolioPercent:F2}% — аварийный выход",
+                //         LogMessageType.Error);
+                //     _tab.CloseAtMarket(pos, pos.OpenVolume, "EmergencyStop");
+                // }
             }
         }
 
         // ════════════════════════════════════════════════════════════════════════════
-        //   SET STOP LOSS
-        //
-        //   Вызывается АСИНХРОННО из PositionOpeningSuccesEvent когда позиция
-        //   переходит в состояние Open — биржа подтвердила исполнение.
-        //
-        //   Выставляет стоп по цене, рассчитанной в момент входа.
-        //
-        //   Стоп находится по pos.OpenOrders[0].NumberUser — тому же ключу, под
-        //   которым он был сохранён синхронно в LogicOpenPosition после BuyAtLimit.
+        //   СОБЫТИЯ ПОЗИЦИИ
         // ════════════════════════════════════════════════════════════════════════════
 
-        private void SetStopLoss(Position pos)
+        /// <summary>
+        /// Позиция открыта (биржа подтвердила исполнение).
+        /// Выставляем начальный стоп и тейк.
+        /// Вызывается АСИНХРОННО — ConcurrentDictionary обеспечивает потокобезопасность.
+        /// </summary>
+        private void OnPositionOpeningSucces(Position pos)
         {
             // Защита от двойного срабатывания
             if (pos.StopOrderRedLine > 0)
@@ -363,25 +616,130 @@ namespace OsEngine.Robots
 
             int orderKey = pos.OpenOrders[0].NumberUser;
 
-            if (!_stopByOrderId.TryGetValue(orderKey, out decimal stopPrice) || stopPrice <= 0)
+            if (!_stopByOrderId.TryRemove(orderKey, out StopProfitPair pair) || pair.StopPrice <= 0)
             {
                 SendNewLogMessage($"[STOP] Стоп не найден для orderKey={orderKey} pos#{pos.Number}", LogMessageType.Error);
                 return;
             }
 
-            // Удаляем сразу — при нескольких позициях стопы других ордеров остаются нетронутыми
-            _stopByOrderId.TryRemove(orderKey, out _);
+            // Ключ удалён сразу при TryRemove — не накапливается
 
-            decimal slippage = stopPrice * (_curSlippagePercent / 100m);
+            decimal slippage = pair.StopPrice * (_curSlippagePercent / 100m);
 
+            // ── Стоп ────────────────────────────────────────────────────────────────
             if (pos.Direction == Side.Buy)
-                _tab.CloseAtStop(pos, stopPrice, stopPrice - slippage);
+                _tab.CloseAtStop(pos, pair.StopPrice, pair.StopPrice - slippage);
             else
-                _tab.CloseAtStop(pos, stopPrice, stopPrice + slippage);
+                _tab.CloseAtStop(pos, pair.StopPrice, pair.StopPrice + slippage);
+
+            // ── Тейк ────────────────────────────────────────────────────────────────
+            if (pair.ProfitPrice > 0)
+            {
+                decimal profitSlippage = pair.ProfitPrice * (_curSlippagePercent / 100m);
+
+                if (pos.Direction == Side.Buy)
+                    _tab.CloseAtProfit(pos, pair.ProfitPrice, pair.ProfitPrice - profitSlippage);
+                else
+                    _tab.CloseAtProfit(pos, pair.ProfitPrice, pair.ProfitPrice + profitSlippage);
+            }
 
             SendNewLogMessage(
-                $"[STOP] pos#{pos.Number} {pos.Direction} | initialStop={stopPrice:F4} orderKey={orderKey}",
+                $"[STOP] pos#{pos.Number} {pos.Direction} | stop={pair.StopPrice:F4} profit={pair.ProfitPrice:F4} orderKey={orderKey}",
                 LogMessageType.System);
+        }
+
+        /// <summary>
+        /// Ордер открытия отклонён биржей или отменён до исполнения.
+        /// Удаляем запись из словаря, иначе она останется навсегда.
+        /// </summary>
+        private void OnPositionOpeningFail(Position pos)
+        {
+            if (pos.OpenOrders == null || pos.OpenOrders.Count == 0)
+                return;
+
+            int orderKey = pos.OpenOrders[0].NumberUser;
+
+            if (_stopByOrderId.TryRemove(orderKey, out _))
+            {
+                SendNewLogMessage(
+                    $"[STOP] Стоп удалён из словаря (OpeningFail) orderKey={orderKey} pos#{pos.Number}",
+                    LogMessageType.System);
+            }
+        }
+
+        /// <summary>
+        /// Позиция успешно закрыта.
+        /// </summary>
+        private void OnPositionClosingSucces(Position pos)
+        {
+            SendNewLogMessage(
+                $"[CLOSE] ✅ pos#{pos.Number} {pos.Direction} закрыта | PnL={pos.ProfitPortfolioPercent:F2}% ({pos.ProfitPortfolioAbs:F4})",
+                LogMessageType.System);
+
+            // TODO: логика после закрытия (сброс счётчиков, запись статистики и т.д.)
+        }
+
+        /// <summary>
+        /// Ордер закрытия не прошёл (биржа отказала).
+        /// Решаем, что делать: повторить, перевыставить, или оставить открытой.
+        /// </summary>
+        private void OnPositionClosingFail(Position pos)
+        {
+            SendNewLogMessage(
+                $"[CLOSE] ❌ Ошибка закрытия pos#{pos.Number} {pos.Direction} — ордер не прошёл",
+                LogMessageType.Error);
+
+            // TODO: повторная попытка закрыть позицию:
+            // if (pos.OpenVolume > 0)
+            //     _tab.CloseAtMarket(pos, pos.OpenVolume, "ClosingFailRetry");
+        }
+
+        /// <summary>
+        /// CloseAtStop сработал (цена пробила уровень стопа).
+        /// </summary>
+        private void OnPositionStopActivate(Position pos)
+        {
+            SendNewLogMessage(
+                $"[STOP] 🔴 Stop activated pos#{pos.Number} {pos.Direction} | RedLine={pos.StopOrderRedLine:F4}",
+                LogMessageType.System);
+        }
+
+        /// <summary>
+        /// CloseAtProfit сработал (цена достигла уровня тейка).
+        /// </summary>
+        private void OnPositionProfitActivate(Position pos)
+        {
+            SendNewLogMessage(
+                $"[PROFIT] 🟢 Profit activated pos#{pos.Number} {pos.Direction} | ProfitLine={pos.ProfitOrderRedLine:F4}",
+                LogMessageType.System);
+        }
+
+        /// <summary>
+        /// BuyAtStop — цена активировала стоп-заявку на покупку.
+        /// </summary>
+        private void OnPositionBuyAtStopActivate(Position pos)
+        {
+            SendNewLogMessage(
+                $"[STOP-OPEN] BuyAtStop активирован pos#{pos.Number}",
+                LogMessageType.System);
+        }
+
+        /// <summary>
+        /// SellAtStop — цена активировала стоп-заявку на продажу.
+        /// </summary>
+        private void OnPositionSellAtStopActivate(Position pos)
+        {
+            SendNewLogMessage(
+                $"[STOP-OPEN] SellAtStop активирован pos#{pos.Number}",
+                LogMessageType.System);
+        }
+
+        /// <summary>
+        /// Изменился чистый объём позиции (частичное исполнение открывающего/закрывающего ордера).
+        /// </summary>
+        private void OnPositionNetVolumeChange(Position pos)
+        {
+            // TODO: реакция на частичное исполнение (pyramid, усреднение и т.д.)
         }
 
         // ════════════════════════════════════════════════════════════════════════════
@@ -403,31 +761,7 @@ namespace OsEngine.Robots
             return GetVolume(side, entryPrice, stopPrice, stopPercent);
         }
 
-        // ════════════════════════════════════════════════════════════════════════════
-        //   ОЧИСТКА СТОПА ПРИ НЕУДАЧНОМ ОТКРЫТИИ
-        //
-        //   Вызывается из PositionOpeningFailEvent — когда ордер на открытие
-        //   отклонён биржей или отменён до исполнения. В этом случае SetStopLoss
-        //   не вызовется, и запись в _stopByOrderId осталась бы навсегда.
-        // ════════════════════════════════════════════════════════════════════════════
-
-        private void OnOpeningFail(Position pos)
-        {
-            if (pos.OpenOrders == null || pos.OpenOrders.Count == 0)
-                return;
-
-            int orderKey = pos.OpenOrders[0].NumberUser;
-
-            if (_stopByOrderId.TryRemove(orderKey, out _))
-            {
-                SendNewLogMessage(
-                    $"[STOP] Стоп удалён из словаря (OpeningFail) orderKey={orderKey} pos#{pos.Number}",
-                    LogMessageType.System);
-            }
-        }
-
         // Контекст одного вызова GetVolume: накапливает промежуточные значения для лога.
-
         private struct VolumeCalcCtx
         {
             public Side Side;
@@ -455,29 +789,23 @@ namespace OsEngine.Robots
                 RejectReason = "ok",
             };
 
-            // --- Входные параметры ---
             if (stopPercent <= 0) return Reject(ref ctx, "stopPercent <= 0");
             if (entryPrice <= 0) return Reject(ref ctx, "entryPrice <= 0");
             if (stopPrice <= 0 && _modeTrade.ValueString == "Futures MOEX")
                 return Reject(ref ctx, "stopPrice <= 0");
 
-            // --- Баланс ---
             ctx.Balance = GetAssetValue(_tab.Portfolio, _assetNameCurrent.ValueString);
             if (ctx.Balance <= 0) return Reject(ref ctx, "balance <= 0");
 
-            // --- Риск ---
             ctx.RealStopPct = stopPercent / 100m
                             + _curSlippagePercent / 100m
                             + _curFeePercent / 100m * 2m;
-            // realStopPct не может быть <= 0 при валидных входных данных,
-            // но оставляем как страховку от некорректных настроек слиппаджа/комиссии
             if (ctx.RealStopPct <= 0) return Reject(ref ctx, "realStopPct <= 0");
 
             ctx.RiskPct = side == Side.Buy ? _curVolumeLong : _curVolumeShort;
             ctx.RiskMoney = ctx.Balance * (ctx.RiskPct / 100m);
             ctx.PosSize = ctx.RiskMoney / ctx.RealStopPct;
 
-            // --- Инструмент ---
             ctx.Sec = _tab.Security;
             if (ctx.Sec == null) return Reject(ref ctx, "sec == null");
 
@@ -504,7 +832,6 @@ namespace OsEngine.Robots
                     return Reject(ref ctx, $"bond maturity too close ({ctx.Sec.MaturityDate:yyyy-MM-dd})");
             }
 
-            // --- Расчёт объёма ---
             decimal mult = ctx.Sec.DecimalsVolume > 0 ? (decimal)Math.Pow(10, ctx.Sec.DecimalsVolume) : 1m;
 
             switch (_modeTrade.ValueString)
@@ -556,15 +883,12 @@ namespace OsEngine.Robots
                     if (ctx.Sec.Lot <= 0) return Reject(ref ctx, "Lot <= 0");
 
                     string selectedAsset = _assetNameCurrent.ValueString.ToUpper();
-                    // Prime запрещён вместе с fiat-активами — баланс должен быть в базовом крипто-активе
                     bool isUsdAsset = selectedAsset == "USDT" || selectedAsset == "USDC" ||
                                       selectedAsset == "USD" || selectedAsset == "RUB" ||
                                       selectedAsset == "EUR" || selectedAsset == "PRIME";
                     if (isUsdAsset)
                         return Reject(ref ctx, $"asset '{selectedAsset}' is USD/fiat — укажите базовый крипто-актив (BTC/ETH/...)");
 
-                    // Для инверсного фьючерса PnL номинирован в базовом активе (BTC/ETH/...),
-                    // поэтому формула отличается от обычной: размер позиции умножается на цену входа.
                     decimal posSizeInverse = ctx.Balance * entryPrice * (ctx.RiskPct / 100m) / ctx.RealStopPct;
                     ctx.Volume = Math.Floor(posSizeInverse / ctx.Sec.Lot * mult) / mult;
                     break;
@@ -574,9 +898,8 @@ namespace OsEngine.Robots
                         ctx.Sec.SecurityType != SecurityType.Option &&
                         ctx.Sec.SecurityType != SecurityType.None)
                         return Reject(ref ctx, $"wrong secType for FuturesMOEX ({ctx.Sec.SecurityType})");
-                    // Prime запрещён — для расчёта ГО нужен только денежный остаток, укажите 'RUB'
                     if (_assetNameCurrent.ValueString.Equals("Prime", StringComparison.OrdinalIgnoreCase))
-                        return Reject(ref ctx, "asset 'Prime' недопустим для Futures MOEX — укажите 'RUB' (денежный остаток)");
+                        return Reject(ref ctx, "asset 'Prime' недопустим для Futures MOEX — укажите 'RUB'");
                     if (ctx.Sec.PriceStep <= 0 || ctx.Sec.PriceStepCost <= 0)
                         return Reject(ref ctx, $"PriceStep={ctx.Sec.PriceStep} PriceStepCost={ctx.Sec.PriceStepCost}");
 
@@ -599,22 +922,17 @@ namespace OsEngine.Robots
 
             if (ctx.Volume <= 0) return Reject(ref ctx, "volume <= 0 after calculation");
 
-            // --- Округление по шагу объёма ---
             if (ctx.Sec.VolumeStep > 0)
                 ctx.Volume = Math.Floor(ctx.Volume / ctx.Sec.VolumeStep) * ctx.Sec.VolumeStep;
 
-            // --- Проверка минимального объёма ---
             if (StartProgram == StartProgram.IsOsOptimizer ||
                 StartProgram == StartProgram.IsTester)
             {
-                // В тестере/оптимизаторе ctx.Sec.MinTradeAmount недоступен —
-                // используем параметр «Min Volume (Tester)» (0 = проверка отключена).
                 if (_curMinVolumeTester > 0 && ctx.Volume < _curMinVolumeTester)
                     return Reject(ref ctx, $"volume={ctx.Volume} < minVolumeTester={_curMinVolumeTester}");
             }
             else
             {
-                // Реальный рынок: берём MinTradeAmount из инструмента.
                 if (ctx.Sec.MinTradeAmount > 0)
                 {
                     decimal minVolume = ctx.Sec.MinTradeAmountType == MinTradeAmountType.C_Currency
@@ -629,7 +947,6 @@ namespace OsEngine.Robots
             return LogVolume(ref ctx);
         }
 
-        // Помечает контекст как отклонённый, логирует и возвращает 0.
         private decimal Reject(ref VolumeCalcCtx ctx, string reason)
         {
             ctx.Volume = 0;
@@ -666,7 +983,7 @@ namespace OsEngine.Robots
                 DECIMALS VOL           = {s?.DecimalsVolume}
                 VOLUME STEP            = {s?.VolumeStep}
                 MIN TRADE (LOT) AMOUNT = {s?.MinTradeAmount} ({s?.MinTradeAmountType})
-                MIN (LOT) TESTER = {_curMinVolumeTester}
+                MIN (LOT) TESTER       = {_curMinVolumeTester}
                 PRICE STEP             = {s?.PriceStep}
                 STEP COST              = {s?.PriceStepCost}
                 EXPIRATION             = {s?.Expiration:yyyy-MM-dd}
@@ -688,7 +1005,6 @@ namespace OsEngine.Robots
             if (portfolio == null) return 0;
 
             // Prime = суммарная стоимость портфеля в валюте счёта (деньги + открытые позиции).
-            // Вы можете выбрать как Prime, так и конкретный актив — например, USDT. В первом случае объём будет рассчитываться от всего портфеля, во втором — от стоимости только этого актива!
             if (assetName == "Prime") return portfolio.ValueCurrent;
 
             List<PositionOnBoard> positions = portfolio.GetPositionOnBoard();
