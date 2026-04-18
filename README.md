@@ -253,24 +253,6 @@ OsEngine работает в двух потоках одновременно:
 
 `NumberUser` присваивается движком **до отправки на биржу**, поэтому он гарантированно доступен синхронно и уникален для каждой заявки.
 
-### Ключевое отличие от старого шаблона
-
-В старом шаблоне (`TemplateRobotSL`) использовался `TryGetValue` (читает без удаления), а затем отдельно `TryRemove`. В новом шаблоне используется атомарный `TryRemove` — он **одновременно читает и удаляет**, что исключает двойное срабатывание.
-
-```csharp
-// ✅ Новый шаблон: атомарный TryRemove
-if (!_stopByOrderId.TryRemove(orderKey, out StopProfitPair pair) || pair.StopPrice <= 0)
-{
-    SendNewLogMessage($"[STOP] Стоп не найден для orderKey={orderKey}", LogMessageType.Error);
-    return;
-}
-// ключ уже удалён, повторный вызов ничего не найдёт
-_tab.CloseAtStop(pos, pair.StopPrice, pair.StopPrice - slippage);
-
-if (pair.ProfitPrice > 0)
-    _tab.CloseAtProfit(pos, pair.ProfitPrice, pair.ProfitPrice - profitSlippage);
-```
-
 ### Защита от двойного ордера закрытия
 
 В `LogicClosePosition` перед любым `CloseAt*` всегда стоит проверка:
