@@ -776,6 +776,30 @@ namespace OsEngine.Robots
             public decimal Volume;
             public Security Sec;
             public string RejectReason;
+
+            // ── Промежуточные значения для лога ─────────────────────────────────────
+            // SPOT/LinearPerpetual (UsePriceStepCostToCalculateVolume)
+            public decimal ContractCost;        // entryPrice / PriceStep * PriceStepCost
+
+            // Bonds MOEX
+            public decimal BondPrice;           // NominalCurrent * entryPrice / 100
+
+            // InversFutures
+            public decimal PosSizeInverse;      // Balance * entryPrice * RiskPct% / RealStopPct
+
+            // Futures MOEX
+            public decimal StopPts;             // |entry - stop| в пунктах
+            public decimal LossPerContract;     // StopPts / PriceStep * PriceStepCost
+            public decimal VolByRisk;           // RiskMoney / LossPerContract
+            public decimal VolByMargin;         // Balance / margin
+            public decimal MarginUsed;          // MarginBuy или MarginSell (в зависимости от Side)
+            public string LimitingFactor;       // "RISK" или "MARGIN"
+
+            // Портфель
+            public decimal PortfolioValueCurrent;
+            public decimal PortfolioValueBlocked;
+            public decimal PortfolioUnrealizedPnl;
+            public string PortfolioNumber;
         }
 
         private decimal GetVolume(Side side, decimal entryPrice, decimal stopPrice, decimal stopPercent)
@@ -796,6 +820,15 @@ namespace OsEngine.Robots
 
             ctx.Balance = GetAssetValue(_tab.Portfolio, _assetNameCurrent.ValueString);
             if (ctx.Balance <= 0) return Reject(ref ctx, "balance <= 0");
+
+            // Сохраняем данные портфеля для лога
+            if (_tab.Portfolio != null)
+            {
+                ctx.PortfolioNumber = _tab.Portfolio.Number;
+                ctx.PortfolioValueCurrent = _tab.Portfolio.ValueCurrent;
+                ctx.PortfolioValueBlocked = _tab.Portfolio.ValueBlocked;
+                ctx.PortfolioUnrealizedPnl = _tab.Portfolio.UnrealizedPnl;
+            }
 
             ctx.RealStopPct = stopPercent / 100m
                             + _curSlippagePercent / 100m
@@ -845,6 +878,7 @@ namespace OsEngine.Robots
                     if (ctx.Sec.UsePriceStepCostToCalculateVolume && ctx.Sec.PriceStep > 0 && ctx.Sec.PriceStepCost > 0)
                     {
                         decimal contractCost = entryPrice / ctx.Sec.PriceStep * ctx.Sec.PriceStepCost;
+                        ctx.ContractCost = contractCost;
                         if (contractCost <= 0) return Reject(ref ctx, "contractCost <= 0");
                         ctx.Volume = Math.Floor(ctx.PosSize / contractCost * mult) / mult;
                     }
@@ -872,6 +906,7 @@ namespace OsEngine.Robots
                         return Reject(ref ctx, $"Lot={ctx.Sec.Lot} or NominalCurrent={ctx.Sec.NominalCurrent} <= 0");
 
                     decimal bondPrice = ctx.Sec.NominalCurrent * entryPrice / 100m;
+                    ctx.BondPrice = bondPrice;
                     if (bondPrice <= 0) return Reject(ref ctx, "bondPrice <= 0");
                     ctx.Volume = Math.Floor(ctx.PosSize / bondPrice / ctx.Sec.Lot * mult) / mult;
                     break;
@@ -890,6 +925,7 @@ namespace OsEngine.Robots
                         return Reject(ref ctx, $"asset '{selectedAsset}' is USD/fiat — укажите базовый крипто-актив (BTC/ETH/...)");
 
                     decimal posSizeInverse = ctx.Balance * entryPrice * (ctx.RiskPct / 100m) / ctx.RealStopPct;
+                    ctx.PosSizeInverse = posSizeInverse;
                     ctx.Volume = Math.Floor(posSizeInverse / ctx.Sec.Lot * mult) / mult;
                     break;
 
@@ -914,6 +950,13 @@ namespace OsEngine.Robots
                     decimal byRisk = Math.Floor(ctx.RiskMoney / lossPerContract);
                     decimal byGo = Math.Floor(ctx.Balance / margin);
                     ctx.Volume = Math.Min(byRisk, byGo);
+
+                    ctx.MarginUsed = margin;
+                    ctx.StopPts = stopPts;
+                    ctx.LossPerContract = lossPerContract;
+                    ctx.VolByRisk = byRisk;
+                    ctx.VolByMargin = byGo;
+                    ctx.LimitingFactor = byRisk <= byGo ? "RISK" : "MARGIN";
                     break;
 
                 default:
@@ -964,6 +1007,12 @@ namespace OsEngine.Robots
                 SECURITY               = {s?.Name} | TYPE = {s?.SecurityType} | STATE = {s?.State}
                 MODE                   = {_modeTrade.ValueString}
                 SIDE                   = {ctx.Side}
+                START PROGRAM          = {StartProgram}
+                ------ PORTFOLIO ------
+                PORTFOLIO NUMBER       = {ctx.PortfolioNumber}
+                VALUE CURRENT          = {ctx.PortfolioValueCurrent:F2}
+                VALUE BLOCKED          = {ctx.PortfolioValueBlocked:F2}
+                UNREALIZED PNL         = {ctx.PortfolioUnrealizedPnl:F2}
                 ------ ASSET / BALANCE ------
                 ASSET                  = {_assetNameCurrent.ValueString}
                 BALANCE                = {ctx.Balance:F6}
@@ -986,9 +1035,23 @@ namespace OsEngine.Robots
                 MIN (LOT) TESTER       = {_curMinVolumeTester}
                 PRICE STEP             = {s?.PriceStep}
                 STEP COST              = {s?.PriceStepCost}
+                USE STEP COST CALC     = {s?.UsePriceStepCostToCalculateVolume}
                 EXPIRATION             = {s?.Expiration:yyyy-MM-dd}
                 MARGIN BUY             = {s?.MarginBuy}
                 MARGIN SELL            = {s?.MarginSell}
+                NOMINAL CURRENT        = {s?.NominalCurrent}
+                MATURITY DATE          = {s?.MaturityDate:yyyy-MM-dd}
+                ACI VALUE              = {s?.AciValue}
+                ------ MODE INTERMEDIATES ------
+                CONTRACT COST (SPOT)   = {(ctx.ContractCost != 0 ? ctx.ContractCost.ToString("F6") : "n/a")}
+                BOND PRICE             = {(ctx.BondPrice != 0 ? ctx.BondPrice.ToString("F6") : "n/a")}
+                POS SIZE INVERSE       = {(ctx.PosSizeInverse != 0 ? ctx.PosSizeInverse.ToString("F6") : "n/a")}
+                STOP PTS               = {(ctx.StopPts != 0 ? ctx.StopPts.ToString("F6") : "n/a")}
+                LOSS PER CONTRACT      = {(ctx.LossPerContract != 0 ? ctx.LossPerContract.ToString("F6") : "n/a")}
+                MARGIN USED            = {(ctx.MarginUsed != 0 ? ctx.MarginUsed.ToString("F6") : "n/a")}
+                VOL BY RISK            = {(ctx.VolByRisk != 0 ? ctx.VolByRisk.ToString() : "n/a")}
+                VOL BY MARGIN          = {(ctx.VolByMargin != 0 ? ctx.VolByMargin.ToString() : "n/a")}
+                LIMITING FACTOR        = {(ctx.LimitingFactor ?? "n/a")}
                 ------ RESULT ------
                 VOLUME                 = {ctx.Volume}
                 REJECT REASON          = {ctx.RejectReason}
