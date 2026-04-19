@@ -798,6 +798,13 @@ namespace OsEngine.Robots
             public decimal MarginUsed;          // MarginBuy или MarginSell (в зависимости от Side)
             public string LimitingFactor;       // "RISK" или "MARGIN"
 
+            // Минимальный объём (resolved с учётом типа C_Currency/Contract)
+            public decimal MinVolumeResolved;
+
+            // Лимиты цены инструмента
+            public decimal PriceLimitLow;
+            public decimal PriceLimitHigh;
+
             // Портфель
             public decimal PortfolioValueCurrent;
             public decimal PortfolioValueBlocked;
@@ -844,6 +851,10 @@ namespace OsEngine.Robots
 
             ctx.Sec = _tab.Security;
             if (ctx.Sec == null) return Reject(ref ctx, "sec == null");
+
+            // Сохраняем лимиты цены для лога (доступны только после ctx.Sec)
+            ctx.PriceLimitLow = ctx.Sec.PriceLimitLow;
+            ctx.PriceLimitHigh = ctx.Sec.PriceLimitHigh;
 
             if (StartProgram != StartProgram.IsOsOptimizer &&
                 StartProgram != StartProgram.IsTester)
@@ -986,6 +997,8 @@ namespace OsEngine.Robots
                         ? ctx.Sec.MinTradeAmount / entryPrice
                         : ctx.Sec.MinTradeAmount;
 
+                    ctx.MinVolumeResolved = minVolume;
+
                     if (ctx.Volume < minVolume)
                         return Reject(ref ctx, $"volume={ctx.Volume} < minVolume={minVolume} (MinTradeAmount={ctx.Sec.MinTradeAmount} type={ctx.Sec.MinTradeAmountType})");
                 }
@@ -1031,11 +1044,14 @@ namespace OsEngine.Robots
                 ------ PRICE ------
                 ENTRY PRICE            = {ctx.EntryPrice:F4}
                 STOP PRICE             = {ctx.StopPrice:F4}
+                PRICE LIMIT LOW        = {ctx.PriceLimitLow}
+                PRICE LIMIT HIGH       = {ctx.PriceLimitHigh}
                 ------ INSTRUMENT ------
                 LOT                    = {s?.Lot}
                 DECIMALS VOL           = {s?.DecimalsVolume}
                 VOLUME STEP            = {s?.VolumeStep}
                 MIN TRADE (LOT) AMOUNT = {s?.MinTradeAmount} ({s?.MinTradeAmountType})
+                MIN VOLUME RESOLVED    = {(ctx.MinVolumeResolved != 0 ? ctx.MinVolumeResolved.ToString() : "n/a")}
                 MIN (LOT) TESTER       = {_curMinVolumeTester}
                 PRICE STEP             = {s?.PriceStep}
                 STEP COST              = {s?.PriceStepCost}
