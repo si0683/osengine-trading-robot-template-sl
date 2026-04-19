@@ -778,6 +778,9 @@ namespace OsEngine.Robots
             public string RejectReason;
 
             // ── Промежуточные значения для лога ─────────────────────────────────────
+            // Объём до применения VolumeStep
+            public decimal VolumeRaw;
+
             // SPOT/LinearPerpetual (UsePriceStepCostToCalculateVolume)
             public decimal ContractCost;        // entryPrice / PriceStep * PriceStepCost
 
@@ -965,6 +968,7 @@ namespace OsEngine.Robots
 
             if (ctx.Volume <= 0) return Reject(ref ctx, "volume <= 0 after calculation");
 
+            ctx.VolumeRaw = ctx.Volume;
             if (ctx.Sec.VolumeStep > 0)
                 ctx.Volume = Math.Floor(ctx.Volume / ctx.Sec.VolumeStep) * ctx.Sec.VolumeStep;
 
@@ -1053,6 +1057,7 @@ namespace OsEngine.Robots
                 VOL BY MARGIN          = {(ctx.VolByMargin != 0 ? ctx.VolByMargin.ToString() : "n/a")}
                 LIMITING FACTOR        = {(ctx.LimitingFactor ?? "n/a")}
                 ------ RESULT ------
+                VOLUME RAW (pre-step)  = {(ctx.VolumeRaw != 0 ? ctx.VolumeRaw.ToString() : "n/a")}
                 VOLUME                 = {ctx.Volume}
                 REJECT REASON          = {ctx.RejectReason}
                 -";
