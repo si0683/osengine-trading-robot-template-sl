@@ -47,7 +47,6 @@ namespace OsEngine.Robots
         private readonly StrategyParameterString _assetNameCurrent;
         private readonly StrategyParameterDecimal _volumeLong;
         private readonly StrategyParameterDecimal _volumeShort;
-        private readonly StrategyParameterDecimal _minVolumeTester;
         private readonly StrategyParameterDecimal _slippagePercent;
         private readonly StrategyParameterDecimal _feePercent;
         private readonly StrategyParameterInt _bondDaysToMaturity;
@@ -78,7 +77,6 @@ namespace OsEngine.Robots
         // Синхронизированные копии параметров GUI (обновляются через SyncParams)
         private decimal _curVolumeLong;
         private decimal _curVolumeShort;
-        private decimal _curMinVolumeTester;
         private decimal _curSlippagePercent;
         private decimal _curFeePercent;
         private int _curBondDaysToMaturity;
@@ -149,7 +147,6 @@ namespace OsEngine.Robots
                 new[] { "USDT", "USDC", "USD", "RUB", "EUR", "BTC", "ETH", "XRP", "LTC", "SOL", "Prime" }, "Base");
             _volumeLong = CreateParameter("Volume Long (%)", 2.5m, 0.1m, 50m, 0.1m, "Base");
             _volumeShort = CreateParameter("Volume Short (%)", 2.5m, 0.1m, 50m, 0.1m, "Base");
-            _minVolumeTester = CreateParameter("Min LOT (Tester)", 0m, 0m, 1000m, 0.01m, "Base");
             _slippagePercent = CreateParameter("Slippage (%)", 0.1m, 0.01m, 2m, 0.01m, "Base");
             _feePercent = CreateParameter("Fee (%)", 0.1m, 0.01m, 1m, 0.01m, "Base");
             _bondDaysToMaturity = CreateParameter("Bond days to maturity", 30, 1, 365, 1, "Base");
@@ -244,7 +241,6 @@ namespace OsEngine.Robots
         {
             _curVolumeLong = _volumeLong.ValueDecimal;
             _curVolumeShort = _volumeShort.ValueDecimal;
-            _curMinVolumeTester = _minVolumeTester.ValueDecimal;
             _curSlippagePercent = _slippagePercent.ValueDecimal;
             _curFeePercent = _feePercent.ValueDecimal;
             _curTimeZoneUtc = _timeZoneUtc.ValueInt;
@@ -983,25 +979,16 @@ namespace OsEngine.Robots
             if (ctx.Sec.VolumeStep > 0)
                 ctx.Volume = Math.Floor(ctx.Volume / ctx.Sec.VolumeStep) * ctx.Sec.VolumeStep;
 
-            if (StartProgram == StartProgram.IsOsOptimizer ||
-                StartProgram == StartProgram.IsTester)
+            if (ctx.Sec.MinTradeAmount > 0)
             {
-                if (_curMinVolumeTester > 0 && ctx.Volume < _curMinVolumeTester)
-                    return Reject(ref ctx, $"volume={ctx.Volume} < minVolumeTester={_curMinVolumeTester}");
-            }
-            else
-            {
-                if (ctx.Sec.MinTradeAmount > 0)
-                {
-                    decimal minVolume = ctx.Sec.MinTradeAmountType == MinTradeAmountType.C_Currency
-                        ? ctx.Sec.MinTradeAmount / entryPrice
-                        : ctx.Sec.MinTradeAmount;
+                decimal minVolume = ctx.Sec.MinTradeAmountType == MinTradeAmountType.C_Currency
+                    ? ctx.Sec.MinTradeAmount / entryPrice
+                    : ctx.Sec.MinTradeAmount;
 
-                    ctx.MinVolumeResolved = minVolume;
+                ctx.MinVolumeResolved = minVolume;
 
-                    if (ctx.Volume < minVolume)
-                        return Reject(ref ctx, $"volume={ctx.Volume} < minVolume={minVolume} (MinTradeAmount={ctx.Sec.MinTradeAmount} type={ctx.Sec.MinTradeAmountType})");
-                }
+                if (ctx.Volume < minVolume)
+                    return Reject(ref ctx, $"volume={ctx.Volume} < minVolume={minVolume} (MinTradeAmount={ctx.Sec.MinTradeAmount} type={ctx.Sec.MinTradeAmountType})");
             }
 
             return LogVolume(ref ctx);
@@ -1052,7 +1039,6 @@ namespace OsEngine.Robots
                 VOLUME STEP            = {s?.VolumeStep}
                 MIN TRADE (LOT) AMOUNT = {s?.MinTradeAmount} ({s?.MinTradeAmountType})
                 MIN VOLUME RESOLVED    = {(ctx.MinVolumeResolved != 0 ? ctx.MinVolumeResolved.ToString() : "n/a")}
-                MIN (LOT) TESTER       = {_curMinVolumeTester}
                 PRICE STEP             = {s?.PriceStep}
                 STEP COST              = {s?.PriceStepCost}
                 USE STEP COST CALC     = {s?.UsePriceStepCostToCalculateVolume}
