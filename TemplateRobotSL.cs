@@ -41,6 +41,7 @@ namespace OsEngine.Robots
         // ── Базовые параметры ────────────────────────────────────────────────────────
         private readonly StrategyParameterString _regime;
         private readonly StrategyParameterString _tradeLogOnOff;
+        private readonly StrategyParameterString _orderType;
 
         // ── Параметры объёма ─────────────────────────────────────────────────────────
         private readonly StrategyParameterString _modeTrade;
@@ -87,24 +88,36 @@ namespace OsEngine.Robots
 
         // ── Словарь стопов ───────────────────────────────────────────────────────────
         //
-        //   Ключ     = order.NumberUser — уникальный int, присваивается движком при
-        //              создании ордера внутри BuyAtLimit/SellAtLimit, до отправки на биржу.
-        //   Значение = начальная цена стопа, рассчитанная для этой конкретной заявки.
+        //   Ключ     = pos.Number — уникальный номер позиции, известен сразу после
+        //              BuyAtLimit/BuyAtMarket и не меняется до закрытия.
+        //              Используем pos.Number (а не order.NumberUser) потому что при
+        //              рыночном ордере OpenOrders заполняется асинхронно внутри
+        //              IcebergMaker — к моменту возврата из BuyAtMarket OpenOrders
+        //              может быть ещё пустым. pos.Number всегда доступен сразу.
         //
-        //   Запись добавляется сразу после BuyAtLimit (синхронно, поток свечей).
-        //   Запись удаляется в SetStopAndProfit (асинхронно, поток событий биржи),
-        //   либо в OnOpeningFail (ордер отклонён биржей).
+        //   Значение = StopData:
+        //     IsMarket = false (лимитный ордер):
+        //       Цена входа известна заранее → стоп хранится как абсолютная цена.
+        //       OnPositionOpeningSucces использует StopPrice напрямую.
+        //
+        //     IsMarket = true (рыночный ордер):
+        //       Реальная цена входа неизвестна до исполнения → стоп хранится как
+        //       процент (StopPct). OnPositionOpeningSucces пересчитывает абсолютную
+        //       цену от реального pos.EntryPrice. Это гарантирует что стоп в деньгах
+        //       = RiskMoney независимо от проскальзывания при входе.
+        //
         //   ConcurrentDictionary обеспечивает потокобезопасность без явных lock-ов.
         //
-        private readonly ConcurrentDictionary<int, StopProfitPair> _stopByOrderId
-            = new ConcurrentDictionary<int, StopProfitPair>();
-
-        // Пара стоп + тейк для одного ордера
-        private struct StopProfitPair
+        private struct StopData
         {
-            public decimal StopPrice;
-            public decimal ProfitPrice; // 0 = не использовать
+            public decimal StopPrice;   // абсолютная цена стопа  (лимитный ордер)
+            public decimal StopPct;     // % стопа от entry       (рыночный ордер)
+            public decimal ProfitPrice; // 0 = не выставлять тейк
+            public bool IsMarket;       // true = рыночный, пересчитать от EntryPrice
         }
+
+        private readonly ConcurrentDictionary<int, StopData> _stopByPosNumber
+            = new ConcurrentDictionary<int, StopData>();
 
         // ════════════════════════════════════════════════════════════════════════════
         //   КОНСТРУКТОР
@@ -138,6 +151,15 @@ namespace OsEngine.Robots
                 new[] { "Off", "On", "LONG-POS", "SHORT-POS", "CLOSE-POS" }, "Base");
             _timeZoneUtc = CreateParameter("Time zone UTC", 4, -24, 24, 1, "Base");
             _tradeLogOnOff = CreateParameter("Trade debug log", "Off", new[] { "On", "Off" }, "Base");
+            _orderType = CreateParameter("Order Type", "Limit",
+                new[] { "Limit", "Market" }, "Base");
+            // Limit  — BuyAtLimit / SellAtLimit.
+            //          Цена входа известна заранее → стоп хранится как абсолютная цена.
+            //          Подходит для большинства стратегий.
+            // Market — BuyAtMarket / SellAtMarket.
+            //          Стоп в % пересчитывается от реального EntryPrice в OnPositionOpeningSucces,
+            //          чтобы стоп в деньгах = RiskMoney независимо от проскальзывания.
+            //          Используйте когда важна скорость входа (пробои, тонкий рынок).
 
             // ── Объём ────────────────────────────────────────────────────────────────
             _modeTrade = CreateParameter("Trade Section",
@@ -404,11 +426,19 @@ namespace OsEngine.Robots
         // ════════════════════════════════════════════════════════════════════════════
         //   ЛОГИКА ОТКРЫТИЯ — TODO: реализовать
         //
-        //   Шаблон показывает правильный порядок действий:
-        //   1. Получить сигнальные значения индикаторов
-        //   2. Определить цену стопа (фиксированный % или динамически от индикатора)
-        //   3. Рассчитать объём через CalcVolume(side, entry, stopPrice)
-        //   4. Отправить ордер и сохранить {стоп, тейк} в словарь _stopByOrderId
+        //   Шаблон показывает два варианта входа:
+        //
+        //   Вариант А — лимитный ордер (BuyAtLimit):
+        //     Цена входа известна → стоп хранится как абсолютная цена.
+        //     Ключ словаря = pos.Number.
+        //
+        //   Вариант Б — рыночный ордер (BuyAtMarket):
+        //     Цена входа неизвестна до исполнения → стоп хранится как % (StopPct).
+        //     OnPositionOpeningSucces пересчитает абсолютную цену от реального
+        //     pos.EntryPrice — стоп в деньгах останется равным RiskMoney.
+        //     Ключ словаря = pos.Number (OpenOrders при Market заполняется асинхронно).
+        //
+        //   Пользователь выбирает вариант через параметр "Order Type" в GUI.
         // ════════════════════════════════════════════════════════════════════════════
 
         private void LogicOpenPosition(List<Candle> candles)
@@ -424,42 +454,80 @@ namespace OsEngine.Robots
                 // TODO: условие входа в лонг
                 // if (lastPrice > signalValue)
                 // {
+                //     // ── Цена входа — объявляем ПЕРВОЙ, до расчёта stopPrice ──────────
                 //     decimal entry = _tab.PriceBestAsk;
                 //     if (entry <= 0) entry = lastPrice;
                 //
-                //     // Вариант 1: фиксированный % стоп из параметров
+                //     // ── Стоп: фиксированный % от entry ───────────────────────────────
                 //     decimal stopPrice = entry * (1m - _curStopPercent / 100m);
-                //
-                //     // Вариант 2: динамический стоп от индикатора / свинга:
-                //     // decimal stopPrice = /* ваш уровень */;
+                //     // или динамический: decimal stopPrice = /* ваш уровень */;
                 //
                 //     if (stopPrice <= 0 || stopPrice >= entry) return;
                 //
-                //     decimal volume = CalcVolume(Side.Buy, entry, stopPrice);
-                //     if (volume <= 0) return;
-                //
-                //     decimal slippage = entry * (_curSlippagePercent / 100m);
-                //     Position pos = _tab.BuyAtLimit(volume, entry + slippage);
-                //     // или:  _tab.BuyAtMarket(volume);
-                //     // или:  _tab.BuyAtStop(volume, entry+slippage, entry, StopActivateType.HigherOrEqual, 3);
-                //
-                //     if (pos == null || pos.OpenOrders == null || pos.OpenOrders.Count == 0)
+                //     // ── ВАРИАНТ А: лимитный ордер ─────────────────────────────────
+                //     if (_orderType.ValueString == "Limit")
                 //     {
-                //         SendNewLogMessage("[OPEN] BUY — позиция не создана или OpenOrders пуст", LogMessageType.Error);
-                //         return;
+                //         decimal volume = CalcVolume(Side.Buy, entry, stopPrice);
+                //         if (volume <= 0) return;
+                //
+                //         decimal slippage = entry * (_curSlippagePercent / 100m);
+                //         Position pos = _tab.BuyAtLimit(volume, entry + slippage);
+                //
+                //         if (pos == null)
+                //         {
+                //             SendNewLogMessage("[OPEN] BUY Limit — позиция не создана", LogMessageType.Error);
+                //             return;
+                //         }
+                //
+                //         decimal profitPrice = _curProfitPercent > 0
+                //             ? entry * (1m + _curProfitPercent / 100m) : 0m;
+                //
+                //         // Стоп как абсолютная цена — entry известна заранее
+                //         _stopByPosNumber[pos.Number] = new StopData
+                //         {
+                //             StopPrice   = stopPrice,
+                //             StopPct     = 0m,
+                //             ProfitPrice = profitPrice,
+                //             IsMarket    = false
+                //         };
+                //
+                //         SendNewLogMessage(
+                //             $"[OPEN] BUY Limit | entry≈{entry:F4} stop={stopPrice:F4} profit={profitPrice:F4} vol={volume} pos#{pos.Number}",
+                //             LogMessageType.System);
                 //     }
                 //
-                //     // Тейк: 0 = не выставлять
-                //     decimal profitPrice = _curProfitPercent > 0
-                //         ? entry * (1m + _curProfitPercent / 100m)
-                //         : 0m;
+                //     // ── ВАРИАНТ Б: рыночный ордер ─────────────────────────────────
+                //     else // "Market"
+                //     {
+                //         // entry и stopPrice уже объявлены выше — повторно не объявляем
+                //         decimal stopPct = Math.Abs(entry - stopPrice) / entry * 100m;
                 //
-                //     _stopByOrderId.TryAdd(pos.OpenOrders[0].NumberUser,
-                //         new StopProfitPair { StopPrice = stopPrice, ProfitPrice = profitPrice });
+                //         decimal volume = CalcVolume(Side.Buy, entry, stopPrice);
+                //         if (volume <= 0) return;
                 //
-                //     SendNewLogMessage(
-                //         $"[OPEN] BUY | entry≈{entry:F4} stop={stopPrice:F4} profit={profitPrice:F4} vol={volume}",
-                //         LogMessageType.System);
+                //         Position pos = _tab.BuyAtMarket(volume);
+                //
+                //         if (pos == null)
+                //         {
+                //             SendNewLogMessage("[OPEN] BUY Market — позиция не создана", LogMessageType.Error);
+                //             return;
+                //         }
+                //
+                //         decimal profitPct = _curProfitPercent; // тейк тоже пересчитается от EntryPrice
+                //
+                //         // Стоп как % — реальная цена входа пересчитается в OnPositionOpeningSucces
+                //         _stopByPosNumber[pos.Number] = new StopData
+                //         {
+                //             StopPrice   = 0m,
+                //             StopPct     = stopPct,
+                //             ProfitPrice = profitPct, // здесь храним % для пересчёта
+                //             IsMarket    = true
+                //         };
+                //
+                //         SendNewLogMessage(
+                //             $"[OPEN] BUY Market | entry≈{entry:F4} stopPct={stopPct:F2}% vol={volume} pos#{pos.Number}",
+                //             LogMessageType.System);
+                //     }
                 // }
             }
 
@@ -469,34 +537,76 @@ namespace OsEngine.Robots
                 // TODO: условие входа в шорт
                 // if (lastPrice < signalValue)
                 // {
+                //     // ── Цена входа — объявляем ПЕРВОЙ, до расчёта stopPrice ──────────
                 //     decimal entry = _tab.PriceBestBid;
                 //     if (entry <= 0) entry = lastPrice;
                 //
+                //     // ── Стоп: фиксированный % от entry ───────────────────────────────
                 //     decimal stopPrice = entry * (1m + _curStopPercent / 100m);
+                //     // или динамический: decimal stopPrice = /* ваш уровень */;
+                //
                 //     if (stopPrice <= 0 || stopPrice <= entry) return;
                 //
-                //     decimal volume = CalcVolume(Side.Sell, entry, stopPrice);
-                //     if (volume <= 0) return;
-                //
-                //     decimal slippage = entry * (_curSlippagePercent / 100m);
-                //     Position pos = _tab.SellAtLimit(volume, entry - slippage);
-                //
-                //     if (pos == null || pos.OpenOrders == null || pos.OpenOrders.Count == 0)
+                //     // ── ВАРИАНТ А: лимитный ордер ─────────────────────────────────
+                //     if (_orderType.ValueString == "Limit")
                 //     {
-                //         SendNewLogMessage("[OPEN] SELL — позиция не создана или OpenOrders пуст", LogMessageType.Error);
-                //         return;
+                //         decimal volume = CalcVolume(Side.Sell, entry, stopPrice);
+                //         if (volume <= 0) return;
+                //
+                //         decimal slippage = entry * (_curSlippagePercent / 100m);
+                //         Position pos = _tab.SellAtLimit(volume, entry - slippage);
+                //
+                //         if (pos == null)
+                //         {
+                //             SendNewLogMessage("[OPEN] SELL Limit — позиция не создана", LogMessageType.Error);
+                //             return;
+                //         }
+                //
+                //         decimal profitPrice = _curProfitPercent > 0
+                //             ? entry * (1m - _curProfitPercent / 100m) : 0m;
+                //
+                //         _stopByPosNumber[pos.Number] = new StopData
+                //         {
+                //             StopPrice   = stopPrice,
+                //             StopPct     = 0m,
+                //             ProfitPrice = profitPrice,
+                //             IsMarket    = false
+                //         };
+                //
+                //         SendNewLogMessage(
+                //             $"[OPEN] SELL Limit | entry≈{entry:F4} stop={stopPrice:F4} profit={profitPrice:F4} vol={volume} pos#{pos.Number}",
+                //             LogMessageType.System);
                 //     }
                 //
-                //     decimal profitPrice = _curProfitPercent > 0
-                //         ? entry * (1m - _curProfitPercent / 100m)
-                //         : 0m;
+                //     // ── ВАРИАНТ Б: рыночный ордер ─────────────────────────────────
+                //     else // "Market"
+                //     {
+                //         // entry и stopPrice уже объявлены выше — повторно не объявляем
+                //         decimal stopPct = Math.Abs(entry - stopPrice) / entry * 100m;
                 //
-                //     _stopByOrderId.TryAdd(pos.OpenOrders[0].NumberUser,
-                //         new StopProfitPair { StopPrice = stopPrice, ProfitPrice = profitPrice });
+                //         decimal volume = CalcVolume(Side.Sell, entry, stopPrice);
+                //         if (volume <= 0) return;
                 //
-                //     SendNewLogMessage(
-                //         $"[OPEN] SELL | entry≈{entry:F4} stop={stopPrice:F4} profit={profitPrice:F4} vol={volume}",
-                //         LogMessageType.System);
+                //         Position pos = _tab.SellAtMarket(volume);
+                //
+                //         if (pos == null)
+                //         {
+                //             SendNewLogMessage("[OPEN] SELL Market — позиция не создана", LogMessageType.Error);
+                //             return;
+                //         }
+                //
+                //         _stopByPosNumber[pos.Number] = new StopData
+                //         {
+                //             StopPrice   = 0m,
+                //             StopPct     = stopPct,
+                //             ProfitPrice = _curProfitPercent,
+                //             IsMarket    = true
+                //         };
+                //
+                //         SendNewLogMessage(
+                //             $"[OPEN] SELL Market | entry≈{entry:F4} stopPct={stopPct:F2}% vol={volume} pos#{pos.Number}",
+                //             LogMessageType.System);
+                //     }
                 // }
             }
         }
@@ -594,6 +704,11 @@ namespace OsEngine.Robots
         /// Позиция открыта (биржа подтвердила исполнение).
         /// Выставляем начальный стоп и тейк.
         /// Вызывается АСИНХРОННО — ConcurrentDictionary обеспечивает потокобезопасность.
+        ///
+        /// Два режима в зависимости от StopData.IsMarket:
+        ///   IsMarket = false: используем сохранённую абсолютную цену стопа.
+        ///   IsMarket = true:  пересчитываем стоп от реального pos.EntryPrice по сохранённому %.
+        ///                     Стоп в деньгах = RiskMoney независимо от проскальзывания.
         /// </summary>
         private void OnPositionOpeningSucces(Position pos)
         {
@@ -604,43 +719,83 @@ namespace OsEngine.Robots
                 return;
             }
 
-            if (pos.OpenOrders == null || pos.OpenOrders.Count == 0)
+            if (!_stopByPosNumber.TryRemove(pos.Number, out StopData data))
             {
-                SendNewLogMessage($"[STOP] OpenOrders пуст для pos#{pos.Number} — стоп не выставлен", LogMessageType.Error);
+                SendNewLogMessage($"[STOP] Стоп не найден для pos#{pos.Number}", LogMessageType.Error);
                 return;
             }
 
-            int orderKey = pos.OpenOrders[0].NumberUser;
+            decimal stopPrice;
+            decimal profitPrice;
 
-            if (!_stopByOrderId.TryRemove(orderKey, out StopProfitPair pair) || pair.StopPrice <= 0)
+            if (data.IsMarket)
             {
-                SendNewLogMessage($"[STOP] Стоп не найден для orderKey={orderKey} pos#{pos.Number}", LogMessageType.Error);
-                return;
+                // Рыночный ордер: пересчитываем от реального EntryPrice.
+                // Стоп в деньгах = RiskMoney независимо от проскальзывания при входе.
+                if (data.StopPct <= 0)
+                {
+                    SendNewLogMessage($"[STOP] StopPct <= 0 для pos#{pos.Number}", LogMessageType.Error);
+                    return;
+                }
+
+                decimal realEntry = pos.EntryPrice;
+                if (realEntry <= 0)
+                {
+                    SendNewLogMessage($"[STOP] EntryPrice = 0 для pos#{pos.Number} — стоп не выставлен", LogMessageType.Error);
+                    return;
+                }
+
+                stopPrice = pos.Direction == Side.Buy
+                    ? realEntry * (1m - data.StopPct / 100m)
+                    : realEntry * (1m + data.StopPct / 100m);
+
+                // Тейк тоже пересчитываем от реального EntryPrice (data.ProfitPrice хранит %)
+                profitPrice = data.ProfitPrice > 0
+                    ? (pos.Direction == Side.Buy
+                        ? realEntry * (1m + data.ProfitPrice / 100m)
+                        : realEntry * (1m - data.ProfitPrice / 100m))
+                    : 0m;
             }
+            else
+            {
+                // Лимитный ордер: используем абсолютную цену напрямую.
+                if (data.StopPrice <= 0)
+                {
+                    SendNewLogMessage($"[STOP] StopPrice <= 0 для pos#{pos.Number}", LogMessageType.Error);
+                    return;
+                }
 
-            // Ключ удалён сразу при TryRemove — не накапливается
-
-            decimal slippage = pair.StopPrice * (_curSlippagePercent / 100m);
+                stopPrice = data.StopPrice;
+                profitPrice = data.ProfitPrice;
+            }
 
             // ── Стоп ────────────────────────────────────────────────────────────────
+            decimal slippage = stopPrice * (_curSlippagePercent / 100m);
+
             if (pos.Direction == Side.Buy)
-                _tab.CloseAtStop(pos, pair.StopPrice, pair.StopPrice - slippage);
+                _tab.CloseAtStop(pos, stopPrice, stopPrice - slippage);
             else
-                _tab.CloseAtStop(pos, pair.StopPrice, pair.StopPrice + slippage);
+                _tab.CloseAtStop(pos, stopPrice, stopPrice + slippage);
 
             // ── Тейк ────────────────────────────────────────────────────────────────
-            if (pair.ProfitPrice > 0)
+            if (profitPrice > 0)
             {
-                decimal profitSlippage = pair.ProfitPrice * (_curSlippagePercent / 100m);
+                decimal profitSlippage = profitPrice * (_curSlippagePercent / 100m);
 
                 if (pos.Direction == Side.Buy)
-                    _tab.CloseAtProfit(pos, pair.ProfitPrice, pair.ProfitPrice - profitSlippage);
+                    _tab.CloseAtProfit(pos, profitPrice, profitPrice - profitSlippage);
                 else
-                    _tab.CloseAtProfit(pos, pair.ProfitPrice, pair.ProfitPrice + profitSlippage);
+                    _tab.CloseAtProfit(pos, profitPrice, profitPrice + profitSlippage);
             }
 
+            decimal slPct = pos.EntryPrice > 0
+                ? Math.Abs(pos.EntryPrice - stopPrice) / pos.EntryPrice * 100m
+                : 0m;
+
             SendNewLogMessage(
-                $"[STOP] pos#{pos.Number} {pos.Direction} | stop={pair.StopPrice:F4} profit={pair.ProfitPrice:F4} orderKey={orderKey}",
+                $"[STOP] pos#{pos.Number} {pos.Direction} | " +
+                $"entry={pos.EntryPrice:F4} stop={stopPrice:F4} ({slPct:F2}%) profit={profitPrice:F4} " +
+                $"mode={(data.IsMarket ? "Market" : "Limit")}",
                 LogMessageType.System);
         }
 
@@ -650,15 +805,10 @@ namespace OsEngine.Robots
         /// </summary>
         private void OnPositionOpeningFail(Position pos)
         {
-            if (pos.OpenOrders == null || pos.OpenOrders.Count == 0)
-                return;
-
-            int orderKey = pos.OpenOrders[0].NumberUser;
-
-            if (_stopByOrderId.TryRemove(orderKey, out _))
+            if (_stopByPosNumber.TryRemove(pos.Number, out _))
             {
                 SendNewLogMessage(
-                    $"[STOP] Стоп удалён из словаря (OpeningFail) orderKey={orderKey} pos#{pos.Number}",
+                    $"[STOP] Стоп удалён из словаря (OpeningFail) pos#{pos.Number}",
                     LogMessageType.System);
             }
         }
