@@ -780,6 +780,25 @@ namespace OsEngine.Robots
             // ── Тейк ────────────────────────────────────────────────────────────────
             if (profitPrice > 0)
             {
+                // Проверяем, что тейк выставлен в прибыльную сторону.
+                // Защита от ошибки: лонг — тейк должен быть выше EntryPrice,
+                //                   шорт — тейк должен быть ниже EntryPrice.
+                bool profitIsValid = pos.Direction == Side.Buy
+                    ? profitPrice > pos.EntryPrice
+                    : profitPrice < pos.EntryPrice;
+
+                if (!profitIsValid)
+                {
+                    SendNewLogMessage(
+                        $"[PROFIT] ⚠️ Некорректный уровень тейка {profitPrice:F4} для pos#{pos.Number} " +
+                        $"({pos.Direction}, entry={pos.EntryPrice:F4}) — тейк не выставлен",
+                        LogMessageType.Error);
+                    profitPrice = 0;
+                }
+            }
+
+            if (profitPrice > 0)
+            {
                 decimal profitSlippage = profitPrice * (_curSlippagePercent / 100m);
 
                 if (pos.Direction == Side.Buy)
